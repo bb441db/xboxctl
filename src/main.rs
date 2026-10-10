@@ -86,6 +86,24 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Debugging aids (debug builds only).
+    #[cfg(debug_assertions)]
+    Test {
+        #[command(subcommand)]
+        action: TestAction,
+    },
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Subcommand)]
+enum TestAction {
+    /// Reset the controller, wait for it to restart and re-enumerate, answer
+    /// its Hello and check that it responds. Writes nothing.
+    Reset {
+        /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
+        #[arg(long)]
+        device: Option<String>,
+    },
 }
 
 fn main() {
@@ -133,7 +151,109 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(debug_assertions)]
+        Command::Test {
+            action: TestAction::Reset { device },
+        } => {
+            if let Err(error) = test_reset(device.as_deref(), trace_packets) {
+                eprintln!("Reset test failed: {error}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+/// Exercise the restart an update goes through, without writing anything:
+/// reset, wait for re-enumeration, answer the Hello, check the controller
+/// responds. Prints how long each step took.
+#[cfg(debug_assertions)]
+fn test_reset(device: Option<&str>, trace: bool) -> Result<(), String> {
+    use crate::gip::frame;
+
+    let controller = usb::select_controller(device)?;
+    println!("Resetting {}", describe(&controller));
+    let mut link = UsbLink::open(&controller, trace)?;
+    start_device(&mut link)?;
+
+    let start = Instant::now();
+    let ms = |since: Instant| since.elapsed().as_millis();
+    link.send(&frame::packet(
+        frame::CMD_SET_DEVICE_STATE,
+        frame::FLAG_SYSTEM,
+        0x02,
+        &[frame::STATE_RESET],
+    ))?;
+
+    // Power-off status (bits 6-7 clear). The link may also drop first.
+    let deadline = start + Duration::from_secs(5);
+    loop {
+        match link.recv(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Some(bytes)) => {
+                let Some(packet) = Packet::parse(&bytes) else {
+                    continue;
+                };
+                if packet.command == frame::CMD_STATUS
+                    && packet
+                        .payload
+                        .first()
+                        .is_some_and(|status| status & 0xc0 == 0)
+                {
+                    println!("  power-off status after {} ms", ms(start));
+                    break;
+                }
+            }
+            Ok(None) => {
+                println!("  no power-off status within 5 s");
+                break;
+            }
+            Err(error) => {
+                println!("  link dropped after {} ms ({error})", ms(start));
+                break;
+            }
+        }
+    }
+
+    link.reconnect(Duration::from_secs(30))?;
+    println!("  reopened after {} ms", ms(start));
+
+    let reopened = Instant::now();
+    let deadline = reopened + Duration::from_secs(1);
+    let mut hello = None;
+    while let Some(bytes) = link.recv(deadline.saturating_duration_since(Instant::now()))? {
+        if let Some(found) = Packet::parse(&bytes).as_ref().and_then(Hello::parse) {
+            hello = Some(found);
+            break;
+        }
+    }
+    match hello {
+        Some(hello) => println!(
+            "  Hello {} ms after reopening (firmware {})",
+            ms(reopened),
+            hello.firmware
+        ),
+        None => println!("  no Hello within 1 s of reopening"),
+    }
+    link.send(&frame::packet(
+        frame::CMD_SET_DEVICE_STATE,
+        frame::FLAG_SYSTEM,
+        0x03,
+        &[frame::STATE_START],
+    ))?;
+    println!("  answered with Start after {} ms", ms(start));
+
+    let options = Options {
+        response_timeout: Duration::from_secs(1),
+        attempts: 2,
+        ..Options::default()
+    };
+    let mut ignore = |_: &Event| {};
+    let info = Updater::new(&mut link, options, &mut ignore).query_info()?;
+    println!(
+        "Controller responds again (update protocol {}), {} ms after the reset.",
+        info.protocol,
+        ms(start)
+    );
+    Ok(())
 }
 
 fn describe(controller: &Controller) -> String {

@@ -139,6 +139,15 @@ pub fn select_controller(location: Option<&str>) -> Result<Controller, String> {
     }
 }
 
+fn serial_number(controller: &Controller, handle: &Handle) -> Option<String> {
+    let index = controller
+        .device
+        .device_descriptor()
+        .ok()?
+        .serial_number_string_index()?;
+    handle.read_string_descriptor_ascii(index).ok()
+}
+
 /// Open the controller and claim interface 0, detaching `xpad` (it is
 /// reattached when the interface is released).
 fn claim(controller: &Controller) -> Result<Handle, rusb::Error> {
@@ -152,7 +161,8 @@ fn claim(controller: &Controller) -> Result<Handle, rusb::Error> {
 /// IN transfer pending.
 pub struct UsbLink {
     ids: (u16, u16),
-    location: (u8, u8),
+    /// USB serial number; identifies the controller across restarts.
+    serial: Option<String>,
     handle: Arc<Handle>,
     packets: mpsc::Receiver<Result<Vec<u8>, String>>,
     stop: Arc<AtomicBool>,
@@ -208,7 +218,7 @@ impl UsbLink {
         thread::sleep(Duration::from_millis(20));
         Ok(Self {
             ids: (controller.vendor_id, controller.product_id),
-            location: (controller.bus, controller.address),
+            serial: serial_number(controller, &handle),
             handle,
             packets,
             stop,
@@ -241,20 +251,47 @@ impl Link for UsbLink {
         Ok(())
     }
 
-    /// Wait for the controller to re-enumerate at a new address and claim it
-    /// right away, with an IN transfer pending for its Hello.
+    /// Reopen the controller after it restarted and re-enumerated, with an IN
+    /// transfer pending for its Hello.
+    ///
+    /// The restarted controller is recognised by its serial number rather
+    /// than its bus address, which need not change (e.g. on macOS). First
+    /// wait until this connection has dropped: after a reset the old device
+    /// lingers for 1-3.6 s, and opening it then fails.
     fn reconnect(&mut self, timeout: Duration) -> Result<(), String> {
-        self.close();
         let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .packets
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                // Still connected; drop whatever the old device sends.
+                Ok(Ok(_)) => {}
+                // A read error, or the reader already stopped after one.
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("the controller did not disconnect for its restart".to_owned());
+                }
+            }
+        }
+        self.close();
+
         let mut last_error = None;
         loop {
-            if let Some(controller) = find_controllers()?.into_iter().find(|c| {
-                (c.vendor_id, c.product_id) == self.ids && (c.bus, c.address) != self.location
-            }) {
+            for controller in find_controllers()?
+                .into_iter()
+                .filter(|c| (c.vendor_id, c.product_id) == self.ids)
+            {
                 // Right after re-enumeration udev may not have applied the
                 // uaccess permission yet, and xpad may still be binding.
                 match claim(&controller) {
                     Ok(handle) => {
+                        let serial = serial_number(&controller, &handle);
+                        if self.serial.is_some() && serial.is_some() && serial != self.serial {
+                            // A different controller of the same model.
+                            let _ = handle.release_interface(INTERFACE);
+                            continue;
+                        }
                         if self.trace {
                             eprintln!("reconnected at {}", controller.location());
                         }
@@ -262,10 +299,11 @@ impl Link for UsbLink {
                         return Ok(());
                     }
                     Err(
-                        error @ (rusb::Error::Access | rusb::Error::Busy | rusb::Error::NoDevice),
-                    ) => {
-                        last_error = Some((controller.location(), error));
-                    }
+                        error @ (rusb::Error::Access
+                        | rusb::Error::Busy
+                        | rusb::Error::NoDevice
+                        | rusb::Error::Io),
+                    ) => last_error = Some((controller.location(), error)),
                     Err(error) => {
                         return Err(format!(
                             "could not reopen {}: {error}",
