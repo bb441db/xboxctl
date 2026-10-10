@@ -268,13 +268,14 @@ fn describe(controller: &Controller) -> String {
     )
 }
 
-/// What a firmware component is, where known. Only MERL's layout has been
-/// studied: component 1 loads at 0x10000000 and is marked critical (never
-/// written by the updater); component 3's version is the release version.
+/// What a firmware component is, where known. Studied on the Series X|S
+/// (MERL, 0b12) and One S (CRET, 02ea) controllers, which share a layout:
+/// component 1 loads at 0x10000000 and is marked critical (never written by
+/// the updater); component 3's version is the release version.
 fn component_label(vendor_id: u16, product_id: u16, component: u32) -> Option<&'static str> {
     match (vendor_id, product_id, component) {
-        (0x045e, 0x0b12, 1) => Some("bootloader, not updated"),
-        (0x045e, 0x0b12, 3) => Some("application"),
+        (0x045e, 0x0b12 | 0x02ea, 1) => Some("bootloader, not updated"),
+        (0x045e, 0x0b12 | 0x02ea, 3) => Some("application"),
         _ => None,
     }
 }

@@ -1,13 +1,37 @@
 # xboxctl
 
 Inspect and update the firmware of Xbox (GIP) controllers from Linux and
-macOS, without
-the Xbox Accessories app. It speaks the same firmware update protocol ("UFU",
-carried in GIP command `0x0c`) as the Windows updater and downloads firmware
-from the same Microsoft feed.
+macOS, without the Xbox Accessories app. It speaks the same firmware update
+protocol ("UFU", carried in GIP command `0x0c`) as the Windows updater and
+downloads firmware from the same Microsoft feed.
 
-Tested on an Xbox Series X|S controller (`045e:0b12`, codename MERL) and
-against the QEMU-emulated controller in `submodules/qemu`.
+## Supported controllers
+
+Controllers must be connected with a USB cable; updates over the Xbox
+Wireless Adapter or Bluetooth are not supported.
+
+| Controller | USB ID | Codename | Tested |
+|------------|--------|----------|:------:|
+| Xbox Series X\|S Controller | `045e:0b12` | MERL | ✅ |
+| Xbox One S Controller | `045e:02ea` | CRET | ✅ |
+| Xbox Elite Controller Series 2 | `045e:0b00` | DELP | ❌ |
+| Xbox Adaptive Controller | `045e:0b0a` | ZEPH | ❌ |
+| Xbox One Elite Controller | `045e:02e3` | TROY | ❌ |
+| Xbox One Controller (2015) | `045e:02dd` | LANG | ❌ |
+| Xbox One Controller (original) | `045e:02d1`, `045e:02d2` | ARGO, ARGD | ❌ |
+
+The original Xbox One controller uses a legacy update protocol that `xboxctl`
+does not support.
+
+Microsoft's feed also lists models that `xboxctl` has never seen (codenames
+DURA, NORL, ORRE, PARK, NICO). Feed entries with a `-cc-` suffix (variants of
+`0b17` and `0b32`) cannot be selected yet, and the SCUF controller
+(`2e95:0504`) gets MERL firmware, which `update` refuses because the USB IDs
+differ.
+
+Untested controllers may well work: `xboxctl info` and `xboxctl update --latest
+--dry-run` are read-only and show whether a controller speaks the update
+protocol and what an update would change.
 
 ## Installation
 
