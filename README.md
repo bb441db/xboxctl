@@ -39,7 +39,11 @@ On Linux (x86_64, aarch64) and Apple Silicon Macs:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bb441db/xboxctl/main/install.sh | sh
-# or
+```
+
+Or with `wget`:
+
+```bash
 wget -qO- https://raw.githubusercontent.com/bb441db/xboxctl/main/install.sh | sh
 ```
 
