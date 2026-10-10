@@ -1,7 +1,7 @@
 //! UFU requests and responses. Each one is the payload of a GIP 0x0c message
 //! with the system flag; the first byte is the opcode.
 
-use crate::rdhm::Version;
+use crate::gip::rdhm::Version;
 
 pub const GET_INFO: u8 = 0x00;
 pub const GET_VERSION: u8 = 0x01;
@@ -13,6 +13,7 @@ pub const COMPLETE_UPDATE: u8 = 0x05;
 /// Largest WriteBlock data the host sends.
 pub const MAX_WRITE: u32 = 0x1000;
 /// Largest UFU request (WriteBlock header + data).
+#[cfg(test)]
 pub const MAX_REQUEST: usize = 8 + MAX_WRITE as usize;
 
 /// Minimum response length per opcode; the Windows driver drops shorter ones.
@@ -143,6 +144,7 @@ impl Info {
         self.max_write.min(MAX_WRITE) & !3
     }
 
+    #[cfg(test)]
     pub fn to_response(self) -> Vec<u8> {
         let mut out = vec![0u8; MIN_RESPONSE[GET_INFO as usize]];
         out[0] = GET_INFO;

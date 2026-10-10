@@ -1,9 +1,0 @@
-[package]
-name = "gip"
-version = "0.1.0"
-edition = "2024"
-description = "Xbox GIP framing and the UFU firmware update protocol (host and device side)"
-license = "MIT"
-
-[dependencies]
-sha1 = "0.10"

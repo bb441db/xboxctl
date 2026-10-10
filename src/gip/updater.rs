@@ -1,9 +1,9 @@
 //! Host side of UFU: the update sequence the Windows updater runs, as
 //! documented in `docs/firmware-update-host.md`.
 
-use crate::frame::{self, Ack, Packet, Sequence};
-use crate::rdhm::{Component, Package, Version};
-use crate::ufu::{self, ComponentVersion, Info, Status};
+use crate::gip::frame::{self, Ack, Packet, Sequence};
+use crate::gip::rdhm::{Component, Package, Version};
+use crate::gip::ufu::{self, ComponentVersion, Info, Status};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -11,8 +11,14 @@ use std::time::{Duration, Instant};
 /// A packet transport to one controller's GIP interrupt endpoints.
 pub trait Link {
     fn send(&mut self, packet: &[u8]) -> Result<(), String>;
-    /// Next device packet, or `None` after `timeout`.
+    /// Next device packet, or `None` after `timeout`. An error usually means
+    /// the device disconnected.
     fn recv(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String>;
+    /// Reopen the device after it restarted and re-enumerated on USB, as the
+    /// physical controller does after a reset.
+    fn reconnect(&mut self, _timeout: Duration) -> Result<(), String> {
+        Err("this link cannot reconnect".to_owned())
+    }
 }
 
 /// Timeouts and retry limits, defaulting to the Windows updater's.
@@ -43,16 +49,44 @@ impl Default for Options {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Info(Info),
-    DeviceVersion { component: u32, version: Version },
+    /// Every component matches the package after updating.
+    Verified,
+    DeviceVersion {
+        component: u32,
+        version: Version,
+    },
     Order(Vec<u32>),
-    UpToDate { component: u32 },
-    Begin { component: u32, version: Version, size: u32 },
-    Block { component: u32, address: u32, done: u32, total: u32, written: bool },
-    Complete { component: u32 },
-    Skipped { component: u32, reason: &'static str },
+    UpToDate {
+        component: u32,
+    },
+    Begin {
+        component: u32,
+        version: Version,
+        size: u32,
+    },
+    Block {
+        component: u32,
+        address: u32,
+        done: u32,
+        total: u32,
+        written: bool,
+    },
+    Complete {
+        component: u32,
+    },
+    Skipped {
+        component: u32,
+        reason: &'static str,
+    },
     Reset,
-    Retry { op: u8, attempt: u32 },
-    FragmentResend { offset: u32 },
+    Reconnected,
+    Retry {
+        op: u8,
+        attempt: u32,
+    },
+    FragmentResend {
+        offset: u32,
+    },
 }
 
 /// Partition sizes from the Windows known-device table, used when GetVersion
@@ -72,13 +106,19 @@ pub fn update_order<'a>(
     package: &'a Package,
     device: &BTreeMap<u32, ComponentVersion>,
 ) -> Vec<&'a Component> {
-    let candidates: Vec<&Component> =
-        package.components.iter().filter(|c| !c.is_critical()).collect();
+    let candidates: Vec<&Component> = package
+        .components
+        .iter()
+        .filter(|c| !c.is_critical())
+        .collect();
     let partition3 = device
         .get(&3)
         .and_then(|v| v.partition_size)
         .or_else(|| known_partition_size(package.vendor_id, package.product_id, 3));
-    let manifest3 = candidates.iter().find(|c| c.id == 3).map(|c| c.data.len() as u32);
+    let manifest3 = candidates
+        .iter()
+        .find(|c| c.id == 3)
+        .map(|c| c.data.len() as u32);
 
     let ids: &[u32] = match (partition3, manifest3) {
         (Some(partition), Some(size)) => {
@@ -102,6 +142,34 @@ pub fn update_order<'a>(
     ordered
 }
 
+/// What an update would change, in update order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub info: Info,
+    pub components: Vec<PlannedComponent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedComponent {
+    pub id: u32,
+    /// Version on the device now.
+    pub device: Version,
+    /// Version in the package.
+    pub package: Version,
+}
+
+impl PlannedComponent {
+    pub fn needs_update(&self) -> bool {
+        self.device != self.package
+    }
+}
+
+impl Plan {
+    pub fn needs_update(&self) -> bool {
+        self.components.iter().any(PlannedComponent::needs_update)
+    }
+}
+
 pub struct Updater<'a, L: Link> {
     link: &'a mut L,
     options: Options,
@@ -112,7 +180,13 @@ pub struct Updater<'a, L: Link> {
 
 impl<'a, L: Link> Updater<'a, L> {
     pub fn new(link: &'a mut L, options: Options, events: &'a mut dyn FnMut(&Event)) -> Self {
-        Self { link, options, sequence: Sequence::default(), pending: VecDeque::new(), events }
+        Self {
+            link,
+            options,
+            sequence: Sequence::default(),
+            pending: VecDeque::new(),
+            events,
+        }
     }
 
     fn emit(&mut self, event: Event) {
@@ -163,7 +237,12 @@ impl<'a, L: Link> Updater<'a, L> {
         let flags = frame::FLAG_SYSTEM | frame::FLAG_ACME;
         let sequence = self.sequence.take();
         if payload.len() <= frame::PACKET_MAX - 4 {
-            return self.link.send(&frame::packet(frame::CMD_FIRMWARE, flags, sequence, payload));
+            return self.link.send(&frame::packet(
+                frame::CMD_FIRMWARE,
+                flags,
+                sequence,
+                payload,
+            ));
         }
 
         let total = payload.len();
@@ -196,16 +275,22 @@ impl<'a, L: Link> Updater<'a, L> {
                     failures += 1;
                     acked = (ack.received as usize).min(offset);
                     offset = acked;
-                    self.emit(Event::FragmentResend { offset: offset as u32 });
+                    self.emit(Event::FragmentResend {
+                        offset: offset as u32,
+                    });
                 }
                 None => {
                     failures += 1;
                     offset = acked;
-                    self.emit(Event::FragmentResend { offset: offset as u32 });
+                    self.emit(Event::FragmentResend {
+                        offset: offset as u32,
+                    });
                 }
             }
             if failures > 8 {
-                return Err(format!("fragment transfer stalled at byte {acked} of {total}"));
+                return Err(format!(
+                    "fragment transfer stalled at byte {acked} of {total}"
+                ));
             }
         }
         self.link.send(&frame::end_of_fragments(
@@ -244,7 +329,11 @@ impl<'a, L: Link> Updater<'a, L> {
                     && response[0] == op
                 {
                     let status = Status::from_u8(response[1]).ok_or_else(|| {
-                        format!("{} returned unknown status {}", ufu::op_name(op), response[1])
+                        format!(
+                            "{} returned unknown status {}",
+                            ufu::op_name(op),
+                            response[1]
+                        )
                     })?;
                     return Ok((status, response.clone()));
                 }
@@ -260,16 +349,39 @@ impl<'a, L: Link> Updater<'a, L> {
     fn expect_ok(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let (status, response) = self.request(payload)?;
         if status != Status::Ok {
-            return Err(format!("{} failed with status {status:?}", ufu::op_name(payload[0])));
+            return Err(format!(
+                "{} failed with status {status:?}",
+                ufu::op_name(payload[0])
+            ));
         }
         Ok(response)
+    }
+
+    /// GetInfo, without starting an update.
+    pub fn query_info(&mut self) -> Result<Info, String> {
+        let response = self.expect_ok(&ufu::get_info())?;
+        Info::parse(&response).ok_or_else(|| "malformed GetInfo response".to_owned())
+    }
+
+    /// GetVersion for one component; `None` if the device does not have it.
+    pub fn query_version(&mut self, component: u32) -> Result<Option<ComponentVersion>, String> {
+        match self.request(&ufu::get_version(component))? {
+            (Status::Ok, response) => ComponentVersion::parse(&response)
+                .map(Some)
+                .ok_or_else(|| "malformed GetVersion response".to_owned()),
+            (Status::UnknownComponent, _) => Ok(None),
+            (status, _) => Err(format!("GetVersion failed with status {status:?}")),
+        }
     }
 
     fn get_version(&mut self, component: u32) -> Result<ComponentVersion, String> {
         let response = self.expect_ok(&ufu::get_version(component))?;
         let version = ComponentVersion::parse(&response)
             .ok_or_else(|| "malformed GetVersion response".to_owned())?;
-        self.emit(Event::DeviceVersion { component, version: version.version });
+        self.emit(Event::DeviceVersion {
+            component,
+            version: version.version,
+        });
         Ok(version)
     }
 
@@ -277,7 +389,10 @@ impl<'a, L: Link> Updater<'a, L> {
     fn wait_power_off(&mut self, deadline: Instant) -> Result<bool, String> {
         while let Some(packet) = self.recv_packet(deadline)? {
             if packet.command == frame::CMD_STATUS
-                && packet.payload.first().is_some_and(|status| status & 0xc0 == 0)
+                && packet
+                    .payload
+                    .first()
+                    .is_some_and(|status| status & 0xc0 == 0)
             {
                 return Ok(true);
             }
@@ -285,20 +400,44 @@ impl<'a, L: Link> Updater<'a, L> {
         Ok(false)
     }
 
-    /// GIP-level reset in the middle of an update: power-off status, then a
-    /// Hello, then Start.
+    /// Reset in the middle of an update (after `MustReset`), then Start.
+    ///
+    /// The device sends a power-off status, then either a Hello on the same
+    /// connection (the Windows driver's model) or, like the physical
+    /// controller, drops off USB and re-enumerates. In that case the link is
+    /// reopened quickly: a restarted controller that nobody starts goes back
+    /// to sleep after a while.
     fn reset_and_resume(&mut self) -> Result<(), String> {
         self.emit(Event::Reset);
         self.send_set_device_state(frame::STATE_RESET)?;
         let deadline = Instant::now() + self.options.reset_timeout;
-        if !self.wait_power_off(deadline)? {
-            return Err("device did not power off after reset".to_owned());
-        }
+        let mut powered_off = false;
         loop {
-            match self.recv_packet(deadline)? {
-                Some(packet) if packet.command == frame::CMD_HELLO => break,
-                Some(_) => {}
-                None => return Err("device did not send Hello after reset".to_owned()),
+            match self.recv_packet(deadline) {
+                Ok(Some(packet)) if packet.command == frame::CMD_HELLO && powered_off => break,
+                Ok(Some(packet)) => {
+                    if packet.command == frame::CMD_STATUS
+                        && packet
+                            .payload
+                            .first()
+                            .is_some_and(|status| status & 0xc0 == 0)
+                    {
+                        powered_off = true;
+                    }
+                }
+                Ok(None) => {
+                    return Err(if powered_off {
+                        "device did not come back after reset".to_owned()
+                    } else {
+                        "device did not power off after reset".to_owned()
+                    });
+                }
+                Err(_) => {
+                    self.link
+                        .reconnect(deadline.saturating_duration_since(Instant::now()))?;
+                    self.emit(Event::Reconnected);
+                    break;
+                }
             }
         }
         self.pending.clear();
@@ -308,15 +447,22 @@ impl<'a, L: Link> Updater<'a, L> {
     /// Write one component. Returns the number of blocks written.
     fn update_component(&mut self, component: &Component, block: u32) -> Result<u32, String> {
         let size = component.data.len() as u32;
-        let begin =
-            ufu::begin_update(component.id, component.target_address, size, component.version);
+        let begin = ufu::begin_update(
+            component.id,
+            component.target_address,
+            size,
+            component.version,
+        );
         let mut resets = 0;
         loop {
             let (status, _) = self.request(&begin)?;
             match status {
                 Status::Ok => break,
                 Status::ComponentInUse => {
-                    self.emit(Event::Skipped { component: component.id, reason: "in use" });
+                    self.emit(Event::Skipped {
+                        component: component.id,
+                        reason: "in use",
+                    });
                     return Ok(0);
                 }
                 Status::MustReset if resets < 3 => {
@@ -326,7 +472,11 @@ impl<'a, L: Link> Updater<'a, L> {
                 other => return Err(format!("BeginUpdate failed with status {other:?}")),
             }
         }
-        self.emit(Event::Begin { component: component.id, version: component.version, size });
+        self.emit(Event::Begin {
+            component: component.id,
+            version: component.version,
+            size,
+        });
 
         let mut written = 0;
         let mut offset = 0u32;
@@ -356,15 +506,17 @@ impl<'a, L: Link> Updater<'a, L> {
             Status::MustReset => self.reset_and_resume()?,
             other => return Err(format!("CompleteUpdate failed with status {other:?}")),
         }
-        self.emit(Event::Complete { component: component.id });
+        self.emit(Event::Complete {
+            component: component.id,
+        });
         Ok(written)
     }
 
-    /// Update the device to `package`. Ends with the final reset; the device
-    /// then reboots into the new firmware.
-    pub fn run(&mut self, package: &Package) -> Result<(), String> {
-        let response = self.expect_ok(&ufu::get_info())?;
-        let info = Info::parse(&response).ok_or_else(|| "malformed GetInfo response".to_owned())?;
+    /// Read-only check of the device against `package`: GetInfo, the
+    /// device's component versions, and the update order. Fails if the
+    /// package does not belong to or fit this device.
+    pub fn plan(&mut self, package: &Package) -> Result<Plan, String> {
+        let info = self.query_info()?;
         self.emit(Event::Info(info));
         if info.protocol == 1 {
             return Err("device uses the legacy UFU protocol 1, which is not supported".to_owned());
@@ -375,8 +527,7 @@ impl<'a, L: Link> Updater<'a, L> {
                 package.vendor_id, package.product_id, info.vendor_id, info.product_id
             ));
         }
-        let block = info.block_size();
-        if block == 0 {
+        if info.block_size() == 0 {
             return Err("device reported a zero write size".to_owned());
         }
 
@@ -384,19 +535,62 @@ impl<'a, L: Link> Updater<'a, L> {
         for component in package.components.iter().filter(|c| !c.is_critical()) {
             device.insert(component.id, self.get_version(component.id)?);
         }
+        // Refuse packages built for another flash layout before writing
+        // anything (e.g. MERL 5.3's 0x7f000 images on 0x7e000 partitions).
+        for component in package.components.iter().filter(|c| !c.is_critical()) {
+            if let Some(size) = device.get(&component.id).and_then(|v| v.partition_size)
+                && component.data.len() as u64 > u64::from(size)
+            {
+                return Err(format!(
+                    "component {} is {:#x} bytes but the device's partition holds {size:#x}; \
+                     this package does not fit this controller",
+                    component.id,
+                    component.data.len()
+                ));
+            }
+        }
         let order = update_order(package, &device);
         self.emit(Event::Order(order.iter().map(|c| c.id).collect()));
+        Ok(Plan {
+            info,
+            components: order
+                .iter()
+                .map(|component| PlannedComponent {
+                    id: component.id,
+                    device: device[&component.id].version,
+                    package: component.version,
+                })
+                .collect(),
+        })
+    }
+
+    /// Update the device to `package`. Returns `false` if every component was
+    /// already up to date; nothing is written and the device is not reset.
+    /// Otherwise ends with the final reset, after which the device reboots
+    /// into the new firmware.
+    pub fn run(&mut self, package: &Package) -> Result<bool, String> {
+        let plan = self.plan(package)?;
+        let block = plan.info.block_size();
+        let order: Vec<&Component> = plan
+            .components
+            .iter()
+            .filter_map(|planned| package.components.iter().find(|c| c.id == planned.id))
+            .collect();
 
         let mut verified = false;
+        let mut changed = false;
         for _ in 0..self.options.iterations {
             verified = true;
             for component in &order {
                 let version = self.get_version(component.id)?;
                 if version.version == component.version {
-                    self.emit(Event::UpToDate { component: component.id });
+                    self.emit(Event::UpToDate {
+                        component: component.id,
+                    });
                     continue;
                 }
                 // A component also counts as verified if no block needed writing.
+                changed = true;
                 if self.update_component(component, block)? > 0 {
                     verified = false;
                 }
@@ -412,13 +606,18 @@ impl<'a, L: Link> Updater<'a, L> {
             ));
         }
 
+        if !changed {
+            return Ok(false);
+        }
+        self.emit(Event::Verified);
+
         // Final reset: the device powers off and reboots into the new
         // firmware. It may drop off USB before the status arrives.
         self.emit(Event::Reset);
         self.send_set_device_state(frame::STATE_RESET)?;
         let deadline = Instant::now() + self.options.reset_timeout;
         match self.wait_power_off(deadline) {
-            Ok(true) | Err(_) => Ok(()),
+            Ok(true) | Err(_) => Ok(true),
             Ok(false) => Err("device did not power off after the final reset".to_owned()),
         }
     }
@@ -427,15 +626,24 @@ impl<'a, L: Link> Updater<'a, L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{UfuDevice, UfuEndpoint};
-    use crate::rdhm::Component;
+    use crate::gip::device::{UfuDevice, UfuEndpoint};
+    use crate::gip::rdhm::Component;
 
-    /// In-memory controller: UFU endpoint plus GIP reset handling.
+    /// In-memory controller: UFU endpoint plus GIP reset handling. Like the
+    /// physical controller, it drops off USB after a reset.
     struct MockLink {
         endpoint: UfuEndpoint,
         queue: VecDeque<Vec<u8>>,
         drop_every: Option<usize>,
         fragments_seen: usize,
+        disconnected: bool,
+        can_reconnect: bool,
+        reconnects: usize,
+        /// After a restart: the single Hello was sent and must be answered
+        /// with Start before anything else.
+        awaiting_start: bool,
+        /// The Hello went unanswered; the controller ignores the host.
+        stuck: bool,
     }
 
     impl MockLink {
@@ -445,18 +653,48 @@ mod tests {
                 queue: VecDeque::new(),
                 drop_every: None,
                 fragments_seen: 0,
+                disconnected: false,
+                can_reconnect: true,
+                reconnects: 0,
+                awaiting_start: false,
+                stuck: false,
             }
+        }
+
+        /// Unplug and plug back in: a fresh, responsive controller.
+        fn replug(&mut self) {
+            self.disconnected = false;
+            self.queue.clear();
+            self.awaiting_start = false;
+            self.stuck = false;
         }
     }
 
     impl Link for MockLink {
         fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+            if self.disconnected {
+                return Err("device disconnected".to_owned());
+            }
             let packet = Packet::parse(bytes).ok_or("unparsable packet")?;
+            if self.awaiting_start {
+                self.awaiting_start = false;
+                if (packet.command, packet.payload.as_slice())
+                    != (frame::CMD_SET_DEVICE_STATE, &[frame::STATE_START][..])
+                {
+                    self.stuck = true;
+                }
+            }
+            if self.stuck {
+                return Ok(());
+            }
             match packet.command {
                 frame::CMD_FIRMWARE => {
                     if packet.is_fragment() && !packet.is_first_fragment() {
                         self.fragments_seen += 1;
-                        if self.drop_every.is_some_and(|n| self.fragments_seen % n == 0) {
+                        if self
+                            .drop_every
+                            .is_some_and(|n| self.fragments_seen.is_multiple_of(n))
+                        {
                             return Ok(());
                         }
                     }
@@ -464,7 +702,9 @@ mod tests {
                     self.queue.extend(out);
                 }
                 frame::CMD_SET_DEVICE_STATE if packet.payload == [frame::STATE_RESET] => {
-                    self.queue.push_back(vec![0x03, 0x20, 0x01, 0x04, 0, 0, 0, 0]);
+                    self.queue
+                        .push_back(vec![0x03, 0x20, 0x01, 0x04, 0, 0, 0, 0]);
+                    self.disconnected = true;
                 }
                 _ => {}
             }
@@ -472,7 +712,28 @@ mod tests {
         }
 
         fn recv(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, String> {
-            Ok(self.queue.pop_front())
+            match self.queue.pop_front() {
+                Some(packet) => Ok(Some(packet)),
+                None if self.disconnected => Err("device disconnected".to_owned()),
+                None => Ok(None),
+            }
+        }
+
+        fn reconnect(&mut self, _timeout: Duration) -> Result<(), String> {
+            if !self.can_reconnect {
+                return Err("cannot reconnect".to_owned());
+            }
+            self.disconnected = false;
+            self.queue.clear();
+            self.reconnects += 1;
+            // A restarted controller sends one Hello and waits for Start.
+            self.queue.push_back(vec![
+                0x02, 0x20, 0x01, 0x1c, 0x7e, 0xed, 0x8d, 0xa3, 0x8d, 0xaa, 0x00, 0x00, 0x5e, 0x04,
+                0x12, 0x0b, 0x05, 0x00, 0x17, 0x00, 0x06, 0x00, 0x00, 0x00, 0x08, 0x04, 0x01, 0x00,
+                0x01, 0x00, 0x01, 0x00,
+            ]);
+            self.awaiting_start = true;
+            Ok(())
         }
     }
 
@@ -484,17 +745,38 @@ mod tests {
             product_id: 0x0b12,
             version,
             components: vec![
-                Component { id: 2, flags: 0, target_address: 0x1000_5000, version, data: data(3, 0x2100) },
-                Component { id: 4, flags: 0, target_address: 0x1002_7000, version: Version([5, 23, 330, 0]), data: data(5, 0x3000) },
-                Component { id: 3, flags: 0, target_address: 0x1002_7000, version, data: data(7, 0x3004) },
+                Component {
+                    id: 2,
+                    flags: 0,
+                    target_address: 0x1000_5000,
+                    version,
+                    data: data(3, 0x2100),
+                },
+                Component {
+                    id: 4,
+                    flags: 0,
+                    target_address: 0x1002_7000,
+                    version: Version([5, 23, 330, 0]),
+                    data: data(5, 0x3000),
+                },
+                Component {
+                    id: 3,
+                    flags: 0,
+                    target_address: 0x1002_7000,
+                    version,
+                    data: data(7, 0x3004),
+                },
             ],
         }
     }
 
-    fn run(link: &mut MockLink, package: &Package) -> (Result<(), String>, Vec<Event>) {
+    fn run(link: &mut MockLink, package: &Package) -> (Result<bool, String>, Vec<Event>) {
         let mut events = Vec::new();
         let mut record = |event: &Event| events.push(event.clone());
-        let options = Options { ack_timeout: Duration::ZERO, ..Options::default() };
+        let options = Options {
+            ack_timeout: Duration::ZERO,
+            ..Options::default()
+        };
         let result = Updater::new(link, options, &mut record).run(package);
         (result, events)
     }
@@ -513,8 +795,41 @@ mod tests {
         // Components 4 and 3 share an address; 3 is written last.
         for id in [3, 2] {
             let c = package.components.iter().find(|c| c.id == id).unwrap();
-            assert_eq!(device.flash(c.target_address, c.data.len() as u32).unwrap(), &c.data[..]);
+            assert_eq!(
+                device.flash(c.target_address, c.data.len() as u32).unwrap(),
+                &c.data[..]
+            );
         }
+    }
+
+    #[test]
+    fn resumes_after_must_reset_and_usb_restart() {
+        // Component 2 answers CompleteUpdate with MustReset, as the physical
+        // controller does; the update must reconnect and finish 4 and 3.
+        let package = package();
+        let mut link = MockLink::new(Version([5, 17, 3202, 0]));
+        let (result, events) = run(&mut link, &package);
+        assert_eq!(result, Ok(true));
+        // The physical controller's sequence: restarts after CompleteUpdate 2,
+        // BeginUpdate 4, CompleteUpdate 4 and CompleteUpdate 3. Each restart's
+        // Hello must be answered with Start, or the mock gets stuck.
+        assert!(events.contains(&Event::Reconnected));
+        assert_eq!(link.reconnects, 4);
+        assert!(!link.stuck);
+        for component in &package.components {
+            assert_eq!(
+                link.endpoint.device.version(component.id),
+                Some(component.version)
+            );
+        }
+    }
+
+    #[test]
+    fn must_reset_without_reconnect_fails() {
+        let package = package();
+        let mut link = MockLink::new(Version([5, 17, 3202, 0]));
+        link.can_reconnect = false;
+        assert!(run(&mut link, &package).0.is_err());
     }
 
     #[test]
@@ -522,8 +837,24 @@ mod tests {
         let package = package();
         let mut link = MockLink::new(Version([5, 17, 3202, 0]));
         run(&mut link, &package).0.unwrap();
+        // The final reset restarted the mock controller; plug it back in.
+        link.replug();
         let (result, events) = run(&mut link, &package);
-        result.unwrap();
+        assert_eq!(result, Ok(false));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Begin { .. } | Event::Reset))
+        );
+    }
+
+    #[test]
+    fn refuses_component_larger_than_partition() {
+        let mut package = package();
+        package.components[2].data = vec![0; 0x7f000];
+        let mut link = MockLink::new(Version([5, 17, 3202, 0]));
+        let (result, events) = run(&mut link, &package);
+        assert!(result.unwrap_err().contains("does not fit"));
         assert!(!events.iter().any(|e| matches!(e, Event::Begin { .. })));
     }
 
@@ -536,8 +867,14 @@ mod tests {
         let mut link = MockLink::new(Version([5, 17, 3202, 0]));
         let (result, events) = run(&mut link, &package);
         result.unwrap();
-        let writes = events.iter().filter(|e| matches!(e, Event::Block { written: true, .. })).count();
-        eprintln!("order {:?}, {writes} blocks written", events.iter().find(|e| matches!(e, Event::Order(_))));
+        let writes = events
+            .iter()
+            .filter(|e| matches!(e, Event::Block { written: true, .. }))
+            .count();
+        eprintln!(
+            "order {:?}, {writes} blocks written",
+            events.iter().find(|e| matches!(e, Event::Order(_)))
+        );
         let device = &link.endpoint.device;
         for component in package.components.iter().filter(|c| !c.is_critical()) {
             assert_eq!(device.version(component.id), Some(component.version));
@@ -551,10 +888,17 @@ mod tests {
         link.drop_every = Some(23);
         let (result, events) = run(&mut link, &package);
         result.unwrap();
-        assert!(events.iter().any(|e| matches!(e, Event::FragmentResend { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::FragmentResend { .. }))
+        );
         let c = &package.components[0];
         assert_eq!(
-            link.endpoint.device.flash(c.target_address, c.data.len() as u32).unwrap(),
+            link.endpoint
+                .device
+                .flash(c.target_address, c.data.len() as u32)
+                .unwrap(),
             &c.data[..]
         );
     }

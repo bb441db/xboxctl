@@ -69,7 +69,8 @@ impl Package {
         if bytes.len() < HEADER || &bytes[..4] != b"rdhm" {
             return Err("not an rdhm firmware package".to_owned());
         }
-        let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let u32_at =
+            |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         if u32_at(4) != 1 {
             return Err(format!("unsupported rdhm header version {}", u32_at(4)));
         }
@@ -116,7 +117,8 @@ impl Package {
         })
     }
 
-    /// Build a package; used by tests and tooling.
+    /// Build a package; used by tests.
+    #[cfg(test)]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = vec![0u8; HEADER + self.components.len() * ENTRY];
         out[..4].copy_from_slice(b"rdhm");
@@ -133,7 +135,8 @@ impl Package {
             out[entry + 8..entry + 0x0c].copy_from_slice(&offset.to_le_bytes());
             out[entry + 0x0c..entry + 0x10]
                 .copy_from_slice(&(component.data.len() as u32).to_le_bytes());
-            out[entry + 0x10..entry + 0x14].copy_from_slice(&component.target_address.to_le_bytes());
+            out[entry + 0x10..entry + 0x14]
+                .copy_from_slice(&component.target_address.to_le_bytes());
             out[entry + 0x18..entry + 0x20].copy_from_slice(&component.version.to_le());
             out.extend_from_slice(&component.data);
         }

@@ -64,6 +64,7 @@ impl Packet {
         self.flags & FLAG_FRAGMENT != 0
     }
 
+    #[cfg(test)]
     pub fn is_first_fragment(&self) -> bool {
         self.is_fragment() && self.flags & FLAG_INIT_FRAG != 0
     }
@@ -128,7 +129,15 @@ pub fn fragment(
 /// The zero-length fragment that ends a fragmented message, as sent by the
 /// physical controller after its metadata fragments.
 pub fn end_of_fragments(command: u8, flags: u8, sequence: u8, total: u32) -> Vec<u8> {
-    fragment(command, flags & !FLAG_ACME, sequence, total, total, &[], false)
+    fragment(
+        command,
+        flags & !FLAG_ACME,
+        sequence,
+        total,
+        total,
+        &[],
+        false,
+    )
 }
 
 /// Protocol Control ACK for a received packet.
@@ -167,6 +176,34 @@ impl Ack {
     }
 }
 
+/// GIP Hello (0x02) payload: the device announcing itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hello {
+    pub device_id: [u8; 8],
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub firmware: crate::gip::rdhm::Version,
+    /// Last eight bytes; the layout is not known (`08 04 01 00 01 00 01 00`
+    /// on the captured controller).
+    pub hardware: [u8; 8],
+}
+
+impl Hello {
+    pub fn parse(packet: &Packet) -> Option<Self> {
+        let p = &packet.payload;
+        if packet.command != CMD_HELLO || p.len() < 28 {
+            return None;
+        }
+        Some(Self {
+            device_id: p[0..8].try_into().unwrap(),
+            vendor_id: u16::from_le_bytes([p[8], p[9]]),
+            product_id: u16::from_le_bytes([p[10], p[11]]),
+            firmware: crate::gip::rdhm::Version::from_le(&p[12..20]),
+            hardware: p[20..28].try_into().unwrap(),
+        })
+    }
+}
+
 /// Sequence numbers run 1..=255; zero is skipped.
 #[derive(Debug, Clone, Copy)]
 pub struct Sequence(u8);
@@ -186,6 +223,7 @@ impl Sequence {
 }
 
 /// Reassembles one fragmented message at a time.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct Reassembler {
     buffer: Vec<u8>,
@@ -194,6 +232,7 @@ pub struct Reassembler {
     active: bool,
 }
 
+#[cfg(test)]
 impl Reassembler {
     /// Feed a fragment. Returns the full message once every byte arrived.
     pub fn push(&mut self, packet: &Packet, max_total: usize) -> Option<Vec<u8>> {
@@ -258,6 +297,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_captured_hello() {
+        let bytes = [
+            0x02, 0x20, 0xe4, 0x1c, 0x7e, 0xed, 0x8d, 0xa3, 0x8d, 0xaa, 0x00, 0x00, 0x5e, 0x04,
+            0x12, 0x0b, 0x05, 0x00, 0x17, 0x00, 0x06, 0x00, 0x00, 0x00, 0x08, 0x04, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x00,
+        ];
+        let hello = Hello::parse(&Packet::parse(&bytes).unwrap()).unwrap();
+        assert_eq!((hello.vendor_id, hello.product_id), (0x045e, 0x0b12));
+        assert_eq!(hello.firmware.to_string(), "5.23.6.0");
+        assert_eq!(
+            hello.hardware,
+            [0x08, 0x04, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00]
+        );
+    }
+
+    #[test]
     fn parses_captured_ack() {
         let p = Packet::parse(&[
             0x01, 0x20, 0x03, 0x09, 0x00, 0x04, 0x20, 0x3a, 0x00, 0x00, 0x00, 0xe9, 0x00,
@@ -265,7 +320,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             Ack::parse(&p),
-            Some(Ack { command: 0x04, received: 0x3a, remaining: 0xe9 })
+            Some(Ack {
+                command: 0x04,
+                received: 0x3a,
+                remaining: 0xe9
+            })
         );
     }
 
@@ -275,7 +334,15 @@ mod tests {
         let mut r = Reassembler::default();
         let mut out = None;
         for (i, chunk) in message.chunks(FRAGMENT_DATA).enumerate() {
-            let f = fragment(0x0c, FLAG_SYSTEM, 1, 200, (i * FRAGMENT_DATA) as u32, chunk, false);
+            let f = fragment(
+                0x0c,
+                FLAG_SYSTEM,
+                1,
+                200,
+                (i * FRAGMENT_DATA) as u32,
+                chunk,
+                false,
+            );
             out = r.push(&Packet::parse(&f).unwrap(), 0x2000);
         }
         assert_eq!(out, Some(message));

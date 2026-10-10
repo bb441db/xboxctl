@@ -1,23 +1,19 @@
 //! Device side of UFU: a controller with simulated flash. Ported from the QEMU
 //! `usb-xbox-gip` device, which the Windows updater accepted end to end.
 
-use crate::frame::{self, Packet, Reassembler, Sequence};
-use crate::rdhm::Version;
-use crate::ufu::{self, Info, Status};
+use crate::gip::frame::{self, Packet, Reassembler, Sequence};
+use crate::gip::rdhm::Version;
+use crate::gip::ufu::{self, Info, Status};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 
 /// MERL (045e:0b12) flash: every component target address fits in here.
 pub const MERL_FLASH_BASE: u32 = 0x1000_0000;
 pub const MERL_FLASH_SIZE: u32 = 0xa6000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Completed {
-    pub component: u32,
-    pub address: u32,
-    pub size: u32,
-    pub version: Version,
-}
+/// Partition sizes a physical MERL controller (5.23.6.0) reports in its
+/// GetVersion responses.
+pub const MERL_PARTITIONS: [(u32, u32); 4] =
+    [(1, 0x5000), (2, 0x22000), (3, 0x7e000), (4, 0x7e000)];
 
 #[derive(Debug, Clone, Copy)]
 struct Active {
@@ -34,8 +30,10 @@ pub struct UfuDevice {
     flash_base: u32,
     flash: Vec<u8>,
     versions: BTreeMap<u32, Version>,
+    partitions: BTreeMap<u32, u32>,
+    /// BeginUpdate for component 4 already asked for its restart.
+    begin4_reset_done: bool,
     active: Option<Active>,
-    completed: Vec<Completed>,
 }
 
 impl UfuDevice {
@@ -43,7 +41,7 @@ impl UfuDevice {
     pub fn merlin(version: Version) -> Self {
         Self {
             info: Info {
-                // Anything but 1 (legacy); accepted by Windows.
+                // Protocol 2, as the physical controller reports.
                 protocol: 2,
                 flags: 0,
                 vendor_id: 0x045e,
@@ -53,8 +51,9 @@ impl UfuDevice {
             flash_base: MERL_FLASH_BASE,
             flash: vec![0xff; MERL_FLASH_SIZE as usize],
             versions: (1..=4).map(|id| (id, version)).collect(),
+            partitions: MERL_PARTITIONS.into_iter().collect(),
+            begin4_reset_done: false,
             active: None,
-            completed: Vec::new(),
         }
     }
 
@@ -66,11 +65,6 @@ impl UfuDevice {
     pub fn flash(&self, address: u32, size: u32) -> Option<&[u8]> {
         let start = address.checked_sub(self.flash_base)? as usize;
         self.flash.get(start..start.checked_add(size as usize)?)
-    }
-
-    /// Components finished since the last call.
-    pub fn take_completed(&mut self) -> Vec<Completed> {
-        std::mem::take(&mut self.completed)
     }
 
     fn flash_mut(&mut self, address: u32, size: u32) -> Option<&mut [u8]> {
@@ -102,6 +96,14 @@ impl UfuDevice {
                             Some(version) => response[6..14].copy_from_slice(&version.to_le()),
                             None => response[1] = Status::UnknownComponent as u8,
                         }
+                        if let (Some(_), Some(size)) =
+                            (self.versions.get(&id), self.partitions.get(&id))
+                        {
+                            // Optional tail: magic, 4 unknown bytes, partition size.
+                            response.resize(26, 0);
+                            response[14..18].copy_from_slice(&ufu::PARTITION_MAGIC.to_le_bytes());
+                            response[22..26].copy_from_slice(&size.to_le_bytes());
+                        }
                     }
                     _ => response[1] = Status::InvalidArgument as u8,
                 }
@@ -114,10 +116,23 @@ impl UfuDevice {
                     let version = Version::from_le(&request[13..21]);
                     if !self.versions.contains_key(&id) {
                         response[1] = Status::UnknownComponent as u8;
+                    } else if id == 4 && !self.begin4_reset_done {
+                        // The physical controller restarts before writing
+                        // component 4, then accepts the same request.
+                        self.begin4_reset_done = true;
+                        response[1] = Status::MustReset as u8;
                     } else if let Some(region) = self.flash_mut(address, size) {
                         // Erase like real flash so that every block is rewritten.
                         region.fill(0xff);
-                        self.active = Some(Active { component: id, address, size, version });
+                        if id == 4 {
+                            self.begin4_reset_done = false;
+                        }
+                        self.active = Some(Active {
+                            component: id,
+                            address,
+                            size,
+                            version,
+                        });
                     } else {
                         response[1] = Status::InvalidRange as u8;
                     }
@@ -153,13 +168,10 @@ impl UfuDevice {
             ufu::COMPLETE_UPDATE => match self.active.take() {
                 None => response[1] = Status::UpdateNotInProgress as u8,
                 Some(active) => {
+                    // The physical controller answers MustReset for every
+                    // component and applies it after restarting.
+                    response[1] = Status::MustReset as u8;
                     self.versions.insert(active.component, active.version);
-                    self.completed.push(Completed {
-                        component: active.component,
-                        address: active.address,
-                        size: active.size,
-                        version: active.version,
-                    });
                 }
             },
             _ => response[1] = Status::ProtocolError as u8,
@@ -179,7 +191,11 @@ pub struct UfuEndpoint {
 
 impl UfuEndpoint {
     pub fn new(device: UfuDevice) -> Self {
-        Self { device, reassembler: Reassembler::default(), sequence: Sequence::default() }
+        Self {
+            device,
+            reassembler: Reassembler::default(),
+            sequence: Sequence::default(),
+        }
     }
 
     /// Handle a host GIP 0x0c packet; returns device packets to send.

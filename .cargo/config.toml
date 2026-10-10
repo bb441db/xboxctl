@@ -1,0 +1,5 @@
+[env]
+# Vendored libusb links libudev whenever pkg-config can find it. Keep it on
+# netlink instead, so the binary never depends on libudev and musl builds stay
+# fully static.
+LIBUDEV_NO_PKG_CONFIG = "1"
