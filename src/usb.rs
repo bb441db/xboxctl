@@ -41,6 +41,7 @@ impl Controller {
             (0x045e, 0x02ea) => ("Xbox One S Controller", Some("CRET")),
             (0x045e, 0x0b00) => ("Xbox Elite Controller Series 2", Some("DELP")),
             (0x045e, 0x0b0a) => ("Xbox Adaptive Controller", Some("ZEPH")),
+            (0x045e, 0x0b1a | 0x0b1c) => ("Xbox Adaptive Joystick", Some("DURA")),
             (0x045e, 0x0b12) => ("Xbox Series X|S Controller", Some("MERL")),
             _ => ("GIP controller", None),
         }

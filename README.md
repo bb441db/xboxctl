@@ -16,6 +16,7 @@ Wireless Adapter or Bluetooth are not supported.
 | Xbox One S Controller | `045e:02ea` | CRET | ✅ |
 | Xbox Elite Controller Series 2 | `045e:0b00` | DELP | ❌ |
 | Xbox Adaptive Controller | `045e:0b0a` | ZEPH | ❌ |
+| Xbox Adaptive Joystick | `045e:0b1a`, `045e:0b1c` | DURA | ❌ |
 | Xbox One Elite Controller | `045e:02e3` | TROY | ❌ |
 | Xbox One Controller (2015) | `045e:02dd` | LANG | ❌ |
 | Xbox One Controller (original) | `045e:02d1`, `045e:02d2` | ARGO, ARGD | ❌ |
@@ -24,7 +25,8 @@ The original Xbox One controller uses a legacy update protocol that `xboxctl`
 does not support.
 
 Microsoft's feed also lists models that `xboxctl` has never seen (codenames
-DURA, NORL, ORRE, PARK, NICO). Feed entries with a `-cc-` suffix (variants of
+NORL, ORRE, PARK, NICO); their firmware layouts suggest accessories other than
+controllers. Feed entries with a `-cc-` suffix (variants of
 `0b17` and `0b32`) cannot be selected yet, and the SCUF controller
 (`2e95:0504`) gets MERL firmware, which `update` refuses because the USB IDs
 differ.
@@ -226,7 +228,8 @@ A restart looks like this on the wire:
 4. It sends **one** Hello, which the host must answer promptly with Set Device
    State `00` and a non-zero sequence number. Windows answers within 15–31 ms.
    A controller whose Hello is not answered stops responding until it is
-   unplugged.
+   unplugged. The Windows updater gives the controller 30 s to come back
+   (60 s after component 7, which only the Adaptive Controller has).
 5. The update continues with GetVersion; a component completed before the
    restart now reports its new version.
 

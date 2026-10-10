@@ -407,10 +407,20 @@ impl<'a, L: Link> Updater<'a, L> {
     /// controller, drops off USB and re-enumerates. In that case the link is
     /// reopened quickly: a restarted controller that nobody starts goes back
     /// to sleep after a while.
-    fn reset_and_resume(&mut self) -> Result<(), String> {
+    /// How long a restarting device gets to come back. Windows waits twice as
+    /// long after component 7 (the Adaptive Controller's extra image).
+    fn reset_timeout(&self, component: u32) -> Duration {
+        if component == 7 {
+            self.options.reset_timeout * 2
+        } else {
+            self.options.reset_timeout
+        }
+    }
+
+    fn reset_and_resume(&mut self, component: u32) -> Result<(), String> {
         self.emit(Event::Reset);
         self.send_set_device_state(frame::STATE_RESET)?;
-        let deadline = Instant::now() + self.options.reset_timeout;
+        let deadline = Instant::now() + self.reset_timeout(component);
         let mut powered_off = false;
         loop {
             match self.recv_packet(deadline) {
@@ -467,7 +477,7 @@ impl<'a, L: Link> Updater<'a, L> {
                 }
                 Status::MustReset if resets < 3 => {
                     resets += 1;
-                    self.reset_and_resume()?;
+                    self.reset_and_resume(component.id)?;
                 }
                 other => return Err(format!("BeginUpdate failed with status {other:?}")),
             }
@@ -503,7 +513,7 @@ impl<'a, L: Link> Updater<'a, L> {
         let (status, _) = self.request(&ufu::complete_update())?;
         match status {
             Status::Ok => {}
-            Status::MustReset => self.reset_and_resume()?,
+            Status::MustReset => self.reset_and_resume(component.id)?,
             other => return Err(format!("CompleteUpdate failed with status {other:?}")),
         }
         self.emit(Event::Complete {
