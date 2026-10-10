@@ -8,24 +8,41 @@ from the same Microsoft feed.
 Tested on an Xbox Series X|S controller (`045e:0b12`, codename MERL) and
 against the QEMU-emulated controller in `submodules/qemu`.
 
+## Installation
+
+Download a static binary for x86_64 or aarch64 Linux from the
+[releases](https://github.com/bb441db/xboxctl/releases). It has no runtime
+dependencies.
+
+```bash
+arch=$(uname -m)   # x86_64 or aarch64
+curl -LO "https://github.com/bb441db/xboxctl/releases/latest/download/xboxctl-linux-$arch"
+curl -LO "https://github.com/bb441db/xboxctl/releases/latest/download/xboxctl-linux-$arch.sha256"
+sha256sum -c "xboxctl-linux-$arch.sha256"
+install -D -m 755 "xboxctl-linux-$arch" ~/.local/bin/xboxctl
+```
+
+Then install the udev rule below so that it runs without root.
+
 ## Usage
 
 ```bash
-cargo run -- list                       # connected controllers (read-only)
-cargo run -- info                       # identity and per-component firmware versions (read-only)
-cargo run -- download                   # current firmware for the connected model
-cargo run -- download --list            # every model in Microsoft's feed
-cargo run -- update --latest --dry-run  # compare the controller with the current firmware
-cargo run -- update --latest            # install the current firmware
-cargo run -- update <package.bin>       # install an rdhm package file
+xboxctl list                       # connected controllers (read-only)
+xboxctl info                       # identity and per-component firmware versions (read-only)
+xboxctl download                   # current firmware for the connected model
+xboxctl download --list            # every model in Microsoft's feed
+xboxctl update --latest --dry-run  # compare the controller with the current firmware
+xboxctl update --latest            # install the current firmware
+xboxctl update <package.bin>       # install an rdhm package file
 ```
 
 With several controllers connected, choose one with `--device BUS:ADDRESS`
 from `xboxctl list`.
 
 `update` first shows what would change and stops if the controller is already
-up to date. During an update the controller restarts (it re-enumerates on USB)
-and `xboxctl` reconnects to it. Keep it connected until the update finishes.
+up to date. During an update the controller restarts several times (it
+re-enumerates on USB) and `xboxctl` reconnects to it. Keep it connected until
+the update finishes.
 
 Downloads are checked against the SHA-256 in their file name and cached in the
 user cache directory (`~/.cache/xboxctl/firmware` on Linux).
@@ -44,6 +61,14 @@ sudo udevadm control --reload && sudo udevadm trigger
 ```
 
 ## Development
+
+Build from source with Rust (the toolchain is pinned in `rust-toolchain.toml`)
+and a C compiler; libusb is compiled in.
+
+```bash
+cargo build --release      # target/release/xboxctl
+cargo run -- info          # debug build; adds --trace-packets to print every GIP packet
+```
 
 - `src/gip/`: GIP framing, the rdhm package format and the UFU updater. Its
   tests run updates against a simulated controller (`src/gip/device.rs`).
