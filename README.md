@@ -1,6 +1,7 @@
 # xboxctl
 
-Inspect and update the firmware of Xbox (GIP) controllers from Linux, without
+Inspect and update the firmware of Xbox (GIP) controllers from Linux and
+macOS, without
 the Xbox Accessories app. It speaks the same firmware update protocol ("UFU",
 carried in GIP command `0x0c`) as the Windows updater and downloads firmware
 from the same Microsoft feed.
@@ -22,7 +23,8 @@ sha256sum -c "xboxctl-linux-$arch.sha256"
 install -D -m 755 "xboxctl-linux-$arch" ~/.local/bin/xboxctl
 ```
 
-Then install the udev rule below so that it runs without root.
+Then install the udev rule below so that it runs without root. On macOS, build
+from source (see Development) and run it with `sudo`; see Permissions.
 
 ## Usage
 
@@ -45,7 +47,8 @@ re-enumerates on USB) and `xboxctl` reconnects to it. Keep it connected until
 the update finishes.
 
 Downloads are checked against the SHA-256 in their file name and cached in the
-user cache directory (`~/.cache/xboxctl/firmware` on Linux).
+user cache directory (`~/.cache/xboxctl/firmware` on Linux, `~/Library/Caches/xboxctl/firmware` on
+macOS). Under `sudo` the files still go to, and belong to, the user who ran it.
 
 ## Permissions
 
@@ -59,6 +62,17 @@ echo 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}=="ff", AT
   | sudo tee /etc/udev/rules.d/70-xboxctl.rules
 sudo udevadm control --reload && sudo udevadm trigger
 ```
+
+On macOS, a system driver (`XboxUSBDevice`) holds the controller exclusively,
+and there is no udev equivalent for taking it over. Commands that talk to the
+controller (`info`, `update`, ...) must run as root:
+
+```bash
+sudo xboxctl info
+sudo xboxctl update --latest
+```
+
+`list` and `download` do not need root.
 
 ## Development
 

@@ -134,10 +134,11 @@ pub fn download(
                 .read_to_vec()
                 .map_err(|error| format!("could not download {url}: {error}"))?;
             file.verify(&data)?;
-            fs::create_dir_all(directory)
+            create_dir_all_owned(directory)
                 .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
             fs::write(&path, &data)
                 .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+            give_to_sudo_user(&path);
             data
         }
     };
@@ -145,8 +146,67 @@ pub fn download(
     Ok((path, package))
 }
 
+/// The user who ran `sudo xboxctl`, when that is what this process is:
+/// (uid, gid, home directory). Files we create should belong to them, not root.
+#[cfg(unix)]
+fn sudo_user() -> Option<(u32, u32, PathBuf)> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let id = |name: &str| std::env::var(name).ok()?.parse::<u32>().ok();
+    let (uid, gid) = (id("SUDO_UID")?, id("SUDO_GID")?);
+    // SAFETY: getpwuid returns null or a pointer to a static passwd entry, read
+    // immediately and not kept.
+    let home = unsafe {
+        let entry = libc::getpwuid(uid);
+        if entry.is_null() || (*entry).pw_dir.is_null() {
+            return None;
+        }
+        PathBuf::from(std::ffi::OsStr::from_bytes(
+            CStr::from_ptr((*entry).pw_dir).to_bytes(),
+        ))
+    };
+    Some((uid, gid, home))
+}
+
+/// Hand `path` to the user who ran `sudo`; does nothing otherwise.
+fn give_to_sudo_user(path: &Path) {
+    #[cfg(unix)]
+    if let Some((uid, gid, _)) = sudo_user() {
+        let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// `create_dir_all`, giving every directory it creates to the `sudo` user.
+fn create_dir_all_owned(directory: &Path) -> std::io::Result<()> {
+    let missing: Vec<&Path> = directory
+        .ancestors()
+        .take_while(|path| !path.exists())
+        .collect();
+    fs::create_dir_all(directory)?;
+    for path in missing {
+        give_to_sudo_user(path);
+    }
+    Ok(())
+}
+
 /// Default download directory: the platform's per-user cache.
 pub fn cache_dir() -> PathBuf {
+    // Under sudo the environment may describe root; use the invoking user.
+    #[cfg(unix)]
+    if let Some((_, _, home)) = sudo_user() {
+        let base = if cfg!(target_os = "macos") {
+            home.join("Library/Caches")
+        } else {
+            home.join(".cache")
+        };
+        return base.join("xboxctl").join("firmware");
+    }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))

@@ -148,6 +148,11 @@ fn serial_number(controller: &Controller, handle: &Handle) -> Option<String> {
     handle.read_string_descriptor_ascii(index).ok()
 }
 
+#[cfg(target_os = "macos")]
+const ACCESS_HINT: &str = "On macOS the system driver owns the controller; run with sudo.";
+#[cfg(not(target_os = "macos"))]
+const ACCESS_HINT: &str = "Install the udev rule from the README or run as root.";
+
 /// Open the controller and claim interface 0, detaching `xpad` (it is
 /// reattached when the interface is released).
 fn claim(controller: &Controller) -> Result<Handle, rusb::Error> {
@@ -174,8 +179,7 @@ impl UsbLink {
     pub fn open(controller: &Controller, trace: bool) -> Result<Self, String> {
         let handle = claim(controller).map_err(|error| match error {
             rusb::Error::Access => format!(
-                "no permission to open {}. Install the udev rule from the README \
-                 or run as root.",
+                "no permission to open {}. {ACCESS_HINT}",
                 controller.location()
             ),
             error => format!("could not open {}: {error}", controller.location()),
@@ -316,7 +320,7 @@ impl Link for UsbLink {
                 return Err(match last_error {
                     Some((location, rusb::Error::Access)) => format!(
                         "no permission to reopen the restarted controller at {location}. \
-                         Install the udev rule from the README or run as root."
+                         {ACCESS_HINT}"
                     ),
                     Some((location, error)) => {
                         format!("could not reopen the restarted controller at {location}: {error}")
