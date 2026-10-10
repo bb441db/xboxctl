@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/gip", "crates/xboxctl", "crates/xbox-virtual-device"]
+resolver = "3"
