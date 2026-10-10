@@ -1,0 +1,3 @@
+[submodule "submodules/qemu"]
+	path = submodules/qemu
+	url = git@github.com:bb441db/qemu.git
