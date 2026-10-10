@@ -11,20 +11,23 @@ against the QEMU-emulated controller in `submodules/qemu`.
 
 ## Installation
 
-Download a static binary for x86_64 or aarch64 Linux from the
-[releases](https://github.com/bb441db/xboxctl/releases). It has no runtime
-dependencies.
+On Linux (x86_64, aarch64) and Apple Silicon Macs:
 
 ```bash
-arch=$(uname -m)   # x86_64 or aarch64
-curl -LO "https://github.com/bb441db/xboxctl/releases/latest/download/xboxctl-linux-$arch"
-curl -LO "https://github.com/bb441db/xboxctl/releases/latest/download/xboxctl-linux-$arch.sha256"
-sha256sum -c "xboxctl-linux-$arch.sha256"
-install -D -m 755 "xboxctl-linux-$arch" ~/.local/bin/xboxctl
+curl -fsSL https://raw.githubusercontent.com/bb441db/xboxctl/main/install.sh | sh
+# or
+wget -qO- https://raw.githubusercontent.com/bb441db/xboxctl/main/install.sh | sh
 ```
 
-Then install the udev rule below so that it runs without root. On macOS, build
-from source (see Development) and run it with `sudo`; see Permissions.
+The script downloads the binary for your system from the
+[latest release](https://github.com/bb441db/xboxctl/releases/latest), checks
+its SHA-256 and installs it to `~/.local/bin` (Linux) or `/usr/local/bin`
+(macOS). Set `XBOXCTL_INSTALL_DIR` to install elsewhere, or `XBOXCTL_VERSION`
+to a release tag to install that release. The binaries have no runtime
+dependencies; you can also download them from the releases page directly.
+
+On Linux, install the udev rule below so that `xboxctl` runs without root. On
+macOS, run it with `sudo`; see Permissions.
 
 ## Usage
 
