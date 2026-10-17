@@ -256,6 +256,19 @@ fn test_reset(device: Option<&str>, trace: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Advice for a controller that does not answer. On macOS, Chromium-based
+/// browsers open Xbox controllers for web pages that use gamepads and can
+/// take the replies meant for us.
+fn no_response_hint(error: &str) -> &'static str {
+    if cfg!(target_os = "macos") && error.starts_with("no response to ") {
+        "\nAnother program may be reading the controller's replies, such as a \
+         Chromium-based browser (Microsoft Edge, Google Chrome). Quit it, unplug the \
+         controller and plug it back in."
+    } else {
+        ""
+    }
+}
+
 fn describe(controller: &Controller) -> String {
     let (name, codename) = controller.model();
     let (major, minor) = controller.firmware_major_minor();
@@ -338,7 +351,10 @@ fn info(device: Option<&str>, trace: bool) -> Result<(), String> {
     let ufu_info = match ufu.query_info() {
         Ok(ufu_info) => ufu_info,
         Err(error) => {
-            println!("Update protocol: not available ({error})");
+            println!(
+                "Update protocol: not available ({error}){}",
+                no_response_hint(&error)
+            );
             return Ok(());
         }
     };
@@ -479,7 +495,9 @@ fn update(
 
     // Read-only: compare the controller with the package.
     let mut ignore = |_: &Event| {};
-    let plan = Updater::new(&mut link, Options::default(), &mut ignore).plan(&package)?;
+    let plan = Updater::new(&mut link, Options::default(), &mut ignore)
+        .plan(&package)
+        .map_err(|error| format!("{error}{}", no_response_hint(&error)))?;
     for planned in &plan.components {
         if planned.needs_update() {
             println!(
