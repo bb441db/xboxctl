@@ -519,7 +519,16 @@ fn update(
 
     let mut progress = Progress::new();
     let mut report = |event: &Event| progress.event(event);
-    Updater::new(&mut link, Options::default(), &mut report).run(&package)?;
+    // Already written blocks are skipped on the next run, so an interrupted
+    // update continues where it stopped.
+    Updater::new(&mut link, Options::default(), &mut report)
+        .run(&package)
+        .map_err(|error| {
+            format!(
+                "{error}\nUnplug the controller, plug it back in and run the same command \
+                 again: the update continues with the components that still differ."
+            )
+        })?;
 
     // The final reset restarts the controller on USB. Reopen it at its new
     // address and answer its Hello; a restarted controller that nobody
