@@ -113,6 +113,31 @@ pub fn find_controllers() -> Result<Vec<Controller>, String> {
         .collect())
 }
 
+/// Every Microsoft device on the bus, GIP or not, for tracing a restart that
+/// might come back under another product ID. Reads descriptors only.
+fn microsoft_devices() -> String {
+    let Ok(devices) = rusb::devices() else {
+        return String::new();
+    };
+    devices
+        .iter()
+        .filter_map(|device| {
+            let descriptor = device.device_descriptor().ok()?;
+            (descriptor.vendor_id() == 0x045e).then(|| {
+                format!(
+                    "{:03}:{:03} {:04x}:{:04x}{}",
+                    device.bus_number(),
+                    device.address(),
+                    descriptor.vendor_id(),
+                    descriptor.product_id(),
+                    if is_gip(&device) { " (GIP)" } else { "" }
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Pick a controller by `BUS:ADDRESS`, or the only one connected.
 pub fn select_controller(location: Option<&str>) -> Result<Controller, String> {
     let mut controllers = find_controllers()?;
@@ -266,7 +291,9 @@ impl Link for UsbLink {
     /// wait until this connection has dropped: after a reset the old device
     /// lingers for 1-3.6 s, and opening it then fails.
     fn reconnect(&mut self, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let ms = || started.elapsed().as_millis();
         loop {
             match self
                 .packets
@@ -282,6 +309,9 @@ impl Link for UsbLink {
             }
         }
         self.close();
+        if self.trace {
+            eprintln!("reconnect +{} ms: disconnected", ms());
+        }
 
         // On macOS the restarted controller sometimes does not re-enumerate
         // until it is unplugged and plugged back in. Reconnecting matches it
@@ -289,7 +319,15 @@ impl Link for UsbLink {
         let dropped = Instant::now();
         let mut hinted = false;
         let mut last_error = None;
+        let mut seen = None;
         loop {
+            if self.trace {
+                let devices = microsoft_devices();
+                if seen.as_ref() != Some(&devices) {
+                    eprintln!("reconnect +{} ms: devices [{devices}]", ms());
+                    seen = Some(devices);
+                }
+            }
             for controller in find_controllers()?
                 .into_iter()
                 .filter(|c| (c.vendor_id, c.product_id) == self.ids)
@@ -305,7 +343,11 @@ impl Link for UsbLink {
                             continue;
                         }
                         if self.trace {
-                            eprintln!("reconnected at {}", controller.location());
+                            eprintln!(
+                                "reconnect +{} ms: reconnected at {}",
+                                ms(),
+                                controller.location()
+                            );
                         }
                         *self = Self::start(&controller, handle, self.trace)?;
                         return Ok(());
@@ -315,7 +357,16 @@ impl Link for UsbLink {
                         | rusb::Error::Busy
                         | rusb::Error::NoDevice
                         | rusb::Error::Io),
-                    ) => last_error = Some((controller.location(), error)),
+                    ) => {
+                        if self.trace && last_error.as_ref().map(|(_, e)| e) != Some(&error) {
+                            eprintln!(
+                                "reconnect +{} ms: claiming {} failed: {error}",
+                                ms(),
+                                controller.location()
+                            );
+                        }
+                        last_error = Some((controller.location(), error));
+                    }
                     Err(error) => {
                         return Err(format!(
                             "could not reopen {}: {error}",
