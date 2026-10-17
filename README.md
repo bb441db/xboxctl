@@ -77,7 +77,9 @@ from `xboxctl list`.
 `update` first shows what would change and stops if the controller is already
 up to date. During an update the controller restarts several times (it
 re-enumerates on USB) and `xboxctl` reconnects to it. Keep it connected until
-the update finishes.
+the update finishes. If an update stops partway, unplug the controller, plug
+it back in and run the same command again: it continues with the components
+that still differ.
 
 Downloads are checked against the SHA-256 in their file name and cached in the
 user cache directory (`~/.cache/xboxctl/firmware` on Linux, `~/Library/Caches/xboxctl/firmware` on
