@@ -419,7 +419,6 @@ fn download(
 }
 
 /// Install `image`, or the feed's current firmware when `image` is `None`.
-/// Install `image`, or the feed's current firmware when `image` is `None`.
 fn update(
     image: Option<&Path>,
     device: Option<&str>,
