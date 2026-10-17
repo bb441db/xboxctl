@@ -109,6 +109,16 @@ sudo xboxctl update --latest
 
 `list` and `download` do not need root.
 
+A Chromium-based browser (Microsoft Edge, Google Chrome, ...) can also hold
+the controller open on macOS, for web pages that use gamepads, and read the
+replies meant for `xboxctl`, which then reports `no response to GetInfo`. Quit
+the browser, unplug the controller and plug it back in. Apart from
+`WindowServer`, this lists the programs that have the controller open:
+
+```bash
+ioreg -p IOService -l -w0 -r -n Controller | grep IOUserClientCreator
+```
+
 ## Development
 
 Build from source with Rust (the toolchain is pinned in `rust-toolchain.toml`)
