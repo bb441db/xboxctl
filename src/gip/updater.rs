@@ -400,13 +400,6 @@ impl<'a, L: Link> Updater<'a, L> {
         Ok(false)
     }
 
-    /// Reset in the middle of an update (after `MustReset`), then Start.
-    ///
-    /// The device sends a power-off status, then either a Hello on the same
-    /// connection (the Windows driver's model) or, like the physical
-    /// controller, drops off USB and re-enumerates. In that case the link is
-    /// reopened quickly: a restarted controller that nobody starts goes back
-    /// to sleep after a while.
     /// How long a restarting device gets to come back. Windows waits twice as
     /// long after component 7 (the Adaptive Controller's extra image).
     fn reset_timeout(&self, component: u32) -> Duration {
@@ -417,6 +410,13 @@ impl<'a, L: Link> Updater<'a, L> {
         }
     }
 
+    /// Reset in the middle of an update (after `MustReset`), then Start.
+    ///
+    /// The device sends a power-off status, then either a Hello on the same
+    /// connection (the Windows driver's model) or, like the physical
+    /// controller, drops off USB and re-enumerates. In that case the link is
+    /// reopened quickly: a restarted controller that nobody starts goes back
+    /// to sleep after a while.
     fn reset_and_resume(&mut self, component: u32) -> Result<(), String> {
         self.emit(Event::Reset);
         self.send_set_device_state(frame::STATE_RESET)?;
