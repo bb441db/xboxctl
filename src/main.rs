@@ -526,8 +526,9 @@ fn update(
     // address and answer its Hello; a restarted controller that nobody
     // answers stays unresponsive until it is unplugged.
     println!("Waiting for the controller to restart...");
-    // 60 s, as Windows allows for the slowest restart (after component 7).
-    let restarted = link.reconnect(Duration::from_secs(60)).and_then(|()| {
+    // Windows allows 60 s for the slowest restart (after component 7); give
+    // more so a controller that needs a replug on macOS can still be resumed.
+    let restarted = link.reconnect(Duration::from_secs(120)).and_then(|()| {
         start_device(&mut link)?;
         let options = Options {
             response_timeout: Duration::from_secs(1),

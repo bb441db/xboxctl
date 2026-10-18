@@ -20,6 +20,8 @@ type Handle = rusb::DeviceHandle<rusb::GlobalContext>;
 
 /// GIP data interface: vendor class 0xff, subclass 0x47, protocol 0xd0.
 const GIP_INTERFACE_CLASS: (u8, u8, u8) = (0xff, 0x47, 0xd0);
+/// How long a restarting controller may stay away before asking for a replug.
+const REPLUG_HINT_AFTER: Duration = Duration::from_secs(15);
 
 /// A GIP controller found on the USB bus.
 pub struct Controller {
@@ -281,6 +283,11 @@ impl Link for UsbLink {
         }
         self.close();
 
+        // On macOS the restarted controller sometimes does not re-enumerate
+        // until it is unplugged and plugged back in. Reconnecting matches it
+        // by serial number, so a replug lets the update carry on.
+        let dropped = Instant::now();
+        let mut hinted = false;
         let mut last_error = None;
         loop {
             for controller in find_controllers()?
@@ -317,6 +324,13 @@ impl Link for UsbLink {
                     }
                 }
             }
+            if !hinted && dropped.elapsed() >= REPLUG_HINT_AFTER {
+                println!(
+                    "  the controller has not come back yet; unplug it and plug it back in \
+                     to continue"
+                );
+                hinted = true;
+            }
             if Instant::now() >= deadline {
                 return Err(match last_error {
                     Some((location, rusb::Error::Access)) => format!(
@@ -326,7 +340,9 @@ impl Link for UsbLink {
                     Some((location, error)) => {
                         format!("could not reopen the restarted controller at {location}: {error}")
                     }
-                    None => "the controller did not come back after its restart".to_owned(),
+                    None => "the controller did not come back after its restart; unplug and \
+                             replug it, then run the update again"
+                        .to_owned(),
                 });
             }
             thread::sleep(Duration::from_millis(50));

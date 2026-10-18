@@ -39,7 +39,7 @@ impl Default for Options {
             write_timeout: Duration::from_secs(6),
             attempts: 5,
             ack_timeout: Duration::from_millis(500),
-            reset_timeout: Duration::from_secs(30),
+            reset_timeout: Duration::from_secs(120),
             iterations: 10,
         }
     }
