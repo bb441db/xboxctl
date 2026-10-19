@@ -1,0 +1,28 @@
+title: xboxctl
+description: Update Xbox controller firmware on Linux and macOS
+url: https://bb441db.github.io
+baseurl: /xboxctl
+theme: just-the-docs
+color_scheme: xbox
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+search_enabled: true
+heading_anchors: true
+
+aux_links:
+  GitHub: https://github.com/bb441db/xboxctl
+aux_links_new_tab: true
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
