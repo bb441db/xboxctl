@@ -1,5 +1,10 @@
 mod feed;
 mod gip;
+mod holders;
+#[cfg(target_os = "macos")]
+mod iokit;
+#[cfg(unix)]
+mod sys;
 mod usb;
 
 use crate::gip::{
@@ -256,16 +261,17 @@ fn test_reset(device: Option<&str>, trace: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Advice for a controller that does not answer. On macOS, Chromium-based
-/// browsers open Xbox controllers for web pages that use gamepads and can
-/// take the replies meant for us.
-fn no_response_hint(error: &str) -> &'static str {
-    if cfg!(target_os = "macos") && error.starts_with("no response to ") {
-        "\nAnother program may be reading the controller's replies, such as a \
-         Chromium-based browser (Microsoft Edge, Google Chrome). Quit it, unplug the \
-         controller and plug it back in."
-    } else {
-        ""
+/// Advice for a controller that does not answer: another program may be
+/// reading its replies. Names the programs holding it when they can be found.
+fn no_response_hint(controller: &Controller, error: &str) -> String {
+    if !error.starts_with("no response to ") {
+        return String::new();
+    }
+    match usb::holder_hint(controller.vendor_id, controller.product_id) {
+        holders if holders.is_empty() => "\nIf another program uses the controller, quit it. \
+             Then unplug the controller, plug it back in and try again."
+            .to_owned(),
+        holders => format!("{holders}\nThen unplug the controller, plug it back in and try again."),
     }
 }
 
@@ -322,6 +328,10 @@ fn list() -> Result<(), String> {
             Some(serial) => println!("{}  serial {serial}", describe(controller)),
             None => println!("{}", describe(controller)),
         }
+        let holders = usb::holders_of(controller);
+        if !holders.is_empty() {
+            println!("  {}", holders::sentence(&holders));
+        }
     }
     Ok(())
 }
@@ -353,7 +363,7 @@ fn info(device: Option<&str>, trace: bool) -> Result<(), String> {
         Err(error) => {
             println!(
                 "Update protocol: not available ({error}){}",
-                no_response_hint(&error)
+                no_response_hint(&controller, &error)
             );
             return Ok(());
         }
@@ -490,6 +500,22 @@ fn update(
         ));
     }
     println!("Controller: {}", describe(&controller));
+
+    // A program that has the controller open makes the update flaky (it can
+    // take the controller's replies), so say so before touching it. The user
+    // decides at the confirmation prompt.
+    let holders = usb::holders_of(&controller);
+    let holder_warning = (!holders.is_empty()).then(|| {
+        let quit = if holders.len() == 1 { "it" } else { "them" };
+        format!(
+            "Warning: {}. Quit {quit}, unplug the controller, plug it back in and run \
+             this command again, or the update may fail.",
+            holders::sentence(&holders)
+        )
+    });
+    if let Some(warning) = &holder_warning {
+        println!("{warning}");
+    }
     let mut link = UsbLink::open(&controller, trace)?;
     start_device(&mut link)?;
 
@@ -497,7 +523,7 @@ fn update(
     let mut ignore = |_: &Event| {};
     let plan = Updater::new(&mut link, Options::default(), &mut ignore)
         .plan(&package)
-        .map_err(|error| format!("{error}{}", no_response_hint(&error)))?;
+        .map_err(|error| format!("{error}{}", no_response_hint(&controller, &error)))?;
     for planned in &plan.components {
         if planned.needs_update() {
             println!(
@@ -519,6 +545,9 @@ fn update(
         return Ok(());
     }
     if !yes {
+        if let Some(warning) = &holder_warning {
+            println!("\n{warning}");
+        }
         println!(
             "\nThis writes firmware to the controller and restarts it. Keep it connected \
              until the update finishes; an interrupted update can leave it unusable."
@@ -543,8 +572,9 @@ fn update(
         .run(&package)
         .map_err(|error| {
             format!(
-                "{error}\nUnplug the controller, plug it back in and run the same command \
-                 again: the update continues with the components that still differ."
+                "{error}{}\nUnplug the controller, plug it back in and run the same command \
+                 again: the update continues with the components that still differ.",
+                usb::holder_hint(controller.vendor_id, controller.product_id)
             )
         })?;
 

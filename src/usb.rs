@@ -1,7 +1,7 @@
 //! GIP transport over libusb: controller discovery and the interrupt
 //! endpoints of interface 0.
 
-use crate::gip::updater::Link;
+use crate::{gip::updater::Link, holders};
 use std::{
     sync::{
         Arc,
@@ -176,10 +176,62 @@ fn serial_number(controller: &Controller, handle: &Handle) -> Option<String> {
     handle.read_string_descriptor_ascii(index).ok()
 }
 
-#[cfg(target_os = "macos")]
-const ACCESS_HINT: &str = "On macOS the system driver owns the controller; run with sudo.";
-#[cfg(not(target_os = "macos"))]
-const ACCESS_HINT: &str = "Install the udev rule from the README or run as root.";
+/// Other programs that have this controller open; empty when none is found.
+pub fn holders_of(controller: &Controller) -> Vec<holders::Holder> {
+    holders::find(
+        controller.vendor_id,
+        controller.product_id,
+        controller.bus,
+        controller.address,
+    )
+}
+
+/// Which other programs have this model of controller open, as a line to
+/// append to an error; empty when none is found. Looks the controller up again,
+/// because it may have restarted at another address.
+pub fn holder_hint(vendor_id: u16, product_id: u16) -> String {
+    let holders: Vec<_> = find_controllers()
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| (c.vendor_id, c.product_id) == (vendor_id, product_id))
+        .flat_map(holders_of)
+        .collect();
+    if holders.is_empty() {
+        return String::new();
+    }
+    let quit = if holders.len() == 1 { "it" } else { "them" };
+    format!("\n{}; quit {quit}.", holders::sentence(&holders))
+}
+
+/// The error for a controller that refused to open for lack of access.
+/// `subject` is what could not be opened. Names the programs holding the
+/// controller if we can find them; otherwise gives the usual cause on this
+/// platform.
+fn access_error(subject: &str, vendor_id: u16, product_id: u16) -> String {
+    let holders = holder_hint(vendor_id, product_id);
+    if !holders.is_empty() {
+        return format!(
+            "could not open {subject}: another program has it open.{holders}\n\
+             Then unplug the controller, plug it back in and run the command again."
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if crate::sys::is_root() {
+        return format!(
+            "could not open {subject}. Another program probably has the controller open; \
+             unplug it, plug it back in and try again."
+        );
+    }
+    #[cfg(target_os = "macos")]
+    return format!(
+        "no permission to open {subject}. On macOS the system driver owns the controller; \
+         run with sudo."
+    );
+    #[cfg(not(target_os = "macos"))]
+    format!(
+        "no permission to open {subject}. Install the udev rule from the README or run as root."
+    )
+}
 
 /// Open the controller and claim interface 0, detaching `xpad` (it is
 /// reattached when the interface is released).
@@ -206,9 +258,15 @@ pub struct UsbLink {
 impl UsbLink {
     pub fn open(controller: &Controller, trace: bool) -> Result<Self, String> {
         let handle = claim(controller).map_err(|error| match error {
-            rusb::Error::Access => format!(
-                "no permission to open {}. {ACCESS_HINT}",
-                controller.location()
+            rusb::Error::Access => access_error(
+                &controller.location(),
+                controller.vendor_id,
+                controller.product_id,
+            ),
+            rusb::Error::Busy => format!(
+                "{} is in use by another program.{}",
+                controller.location(),
+                holder_hint(controller.vendor_id, controller.product_id)
             ),
             error => format!("could not open {}: {error}", controller.location()),
         })?;
@@ -384,9 +442,14 @@ impl Link for UsbLink {
             }
             if Instant::now() >= deadline {
                 return Err(match last_error {
-                    Some((location, rusb::Error::Access)) => format!(
-                        "no permission to reopen the restarted controller at {location}. \
-                         {ACCESS_HINT}"
+                    Some((location, rusb::Error::Access)) => access_error(
+                        &format!("the restarted controller at {location}"),
+                        self.ids.0,
+                        self.ids.1,
+                    ),
+                    Some((location, rusb::Error::Busy)) => format!(
+                        "the restarted controller at {location} is in use by another program.{}",
+                        holder_hint(self.ids.0, self.ids.1)
                     ),
                     Some((location, error)) => {
                         format!("could not reopen the restarted controller at {location}: {error}")

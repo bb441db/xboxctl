@@ -18,3 +18,7 @@ ureq = "3.4.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+io-kit-sys = "0.5.0"

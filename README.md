@@ -109,14 +109,24 @@ sudo xboxctl update --latest
 
 `list` and `download` do not need root.
 
-A Chromium-based browser (Microsoft Edge, Google Chrome, ...) can also hold
-the controller open on macOS, for web pages that use gamepads, and read the
-replies meant for `xboxctl`, which then reports `no response to GetInfo`. Quit
-the browser, unplug the controller and plug it back in. Apart from
-`WindowServer`, this lists the programs that have the controller open:
+Another program can also hold the controller open, most often a browser with a
+page that uses gamepads (Chromium-based browsers such as Microsoft Edge and
+Google Chrome open Xbox controllers on macOS). It then takes the replies meant
+for `xboxctl`, which reports `no response to GetInfo`, or the controller cannot
+be opened at all. When that happens `xboxctl` looks for the programs that have
+the controller open and names them:
+
+```
+Google Chrome (pid 86018) has the controller open; quit it.
+```
+
+Quit them, unplug the controller and plug it back in. On macOS this reads the
+IOKit registry; on Linux it looks for processes with the controller's USB
+device node open in `/proc` (only processes you may inspect are visible, so run
+as root to see everyone's). To check by hand on macOS:
 
 ```bash
-ioreg -p IOService -l -w0 -r -n Controller | grep IOUserClientCreator
+ioreg -r -c IOUSBHostDevice -l -w0 | grep -E 'UsbExclusiveOwner|IOUserClientCreator'
 ```
 
 ## Development
