@@ -150,26 +150,12 @@ pub fn download(
 /// (uid, gid, home directory). Files we create should belong to them, not root.
 #[cfg(unix)]
 fn sudo_user() -> Option<(u32, u32, PathBuf)> {
-    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
-
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    if unsafe { libc::geteuid() } != 0 {
+    if !crate::sys::is_root() {
         return None;
     }
     let id = |name: &str| std::env::var(name).ok()?.parse::<u32>().ok();
     let (uid, gid) = (id("SUDO_UID")?, id("SUDO_GID")?);
-    // SAFETY: getpwuid returns null or a pointer to a static passwd entry, read
-    // immediately and not kept.
-    let home = unsafe {
-        let entry = libc::getpwuid(uid);
-        if entry.is_null() || (*entry).pw_dir.is_null() {
-            return None;
-        }
-        PathBuf::from(std::ffi::OsStr::from_bytes(
-            CStr::from_ptr((*entry).pw_dir).to_bytes(),
-        ))
-    };
-    Some((uid, gid, home))
+    Some((uid, gid, crate::sys::home_dir(uid)?))
 }
 
 /// Hand `path` to the user who ran `sudo`; does nothing otherwise.

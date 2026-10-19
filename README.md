@@ -77,7 +77,9 @@ from `xboxctl list`.
 `update` first shows what would change and stops if the controller is already
 up to date. During an update the controller restarts several times (it
 re-enumerates on USB) and `xboxctl` reconnects to it. Keep it connected until
-the update finishes.
+the update finishes. If an update stops partway, unplug the controller, plug
+it back in and run the same command again: it continues with the components
+that still differ.
 
 Downloads are checked against the SHA-256 in their file name and cached in the
 user cache directory (`~/.cache/xboxctl/firmware` on Linux, `~/Library/Caches/xboxctl/firmware` on
@@ -106,6 +108,26 @@ sudo xboxctl update --latest
 ```
 
 `list` and `download` do not need root.
+
+Another program can also hold the controller open, most often a browser with a
+page that uses gamepads (Chromium-based browsers such as Microsoft Edge and
+Google Chrome open Xbox controllers on macOS). It then takes the replies meant
+for `xboxctl`, which reports `no response to GetInfo`, or the controller cannot
+be opened at all. When that happens `xboxctl` looks for the programs that have
+the controller open and names them:
+
+```
+Google Chrome (pid 86018) has the controller open; quit it.
+```
+
+Quit them, unplug the controller and plug it back in. On macOS this reads the
+IOKit registry; on Linux it looks for processes with the controller's USB
+device node open in `/proc` (only processes you may inspect are visible, so run
+as root to see everyone's). To check by hand on macOS:
+
+```bash
+ioreg -r -c IOUSBHostDevice -l -w0 | grep -E 'UsbExclusiveOwner|IOUserClientCreator'
+```
 
 ## Development
 

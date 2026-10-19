@@ -1,7 +1,7 @@
 //! GIP transport over libusb: controller discovery and the interrupt
 //! endpoints of interface 0.
 
-use crate::gip::updater::Link;
+use crate::{gip::updater::Link, holders};
 use std::{
     sync::{
         Arc,
@@ -113,6 +113,31 @@ pub fn find_controllers() -> Result<Vec<Controller>, String> {
         .collect())
 }
 
+/// Every Microsoft device on the bus, GIP or not, for tracing a restart that
+/// might come back under another product ID. Reads descriptors only.
+fn microsoft_devices() -> String {
+    let Ok(devices) = rusb::devices() else {
+        return String::new();
+    };
+    devices
+        .iter()
+        .filter_map(|device| {
+            let descriptor = device.device_descriptor().ok()?;
+            (descriptor.vendor_id() == 0x045e).then(|| {
+                format!(
+                    "{:03}:{:03} {:04x}:{:04x}{}",
+                    device.bus_number(),
+                    device.address(),
+                    descriptor.vendor_id(),
+                    descriptor.product_id(),
+                    if is_gip(&device) { " (GIP)" } else { "" }
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Pick a controller by `BUS:ADDRESS`, or the only one connected.
 pub fn select_controller(location: Option<&str>) -> Result<Controller, String> {
     let mut controllers = find_controllers()?;
@@ -151,10 +176,62 @@ fn serial_number(controller: &Controller, handle: &Handle) -> Option<String> {
     handle.read_string_descriptor_ascii(index).ok()
 }
 
-#[cfg(target_os = "macos")]
-const ACCESS_HINT: &str = "On macOS the system driver owns the controller; run with sudo.";
-#[cfg(not(target_os = "macos"))]
-const ACCESS_HINT: &str = "Install the udev rule from the README or run as root.";
+/// Other programs that have this controller open; empty when none is found.
+pub fn holders_of(controller: &Controller) -> Vec<holders::Holder> {
+    holders::find(
+        controller.vendor_id,
+        controller.product_id,
+        controller.bus,
+        controller.address,
+    )
+}
+
+/// Which other programs have this model of controller open, as a line to
+/// append to an error; empty when none is found. Looks the controller up again,
+/// because it may have restarted at another address.
+pub fn holder_hint(vendor_id: u16, product_id: u16) -> String {
+    let holders: Vec<_> = find_controllers()
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| (c.vendor_id, c.product_id) == (vendor_id, product_id))
+        .flat_map(holders_of)
+        .collect();
+    if holders.is_empty() {
+        return String::new();
+    }
+    let quit = if holders.len() == 1 { "it" } else { "them" };
+    format!("\n{}; quit {quit}.", holders::sentence(&holders))
+}
+
+/// The error for a controller that refused to open for lack of access.
+/// `subject` is what could not be opened. Names the programs holding the
+/// controller if we can find them; otherwise gives the usual cause on this
+/// platform.
+fn access_error(subject: &str, vendor_id: u16, product_id: u16) -> String {
+    let holders = holder_hint(vendor_id, product_id);
+    if !holders.is_empty() {
+        return format!(
+            "could not open {subject}: another program has it open.{holders}\n\
+             Then unplug the controller, plug it back in and run the command again."
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if crate::sys::is_root() {
+        return format!(
+            "could not open {subject}. Another program probably has the controller open; \
+             unplug it, plug it back in and try again."
+        );
+    }
+    #[cfg(target_os = "macos")]
+    return format!(
+        "no permission to open {subject}. On macOS the system driver owns the controller; \
+         run with sudo."
+    );
+    #[cfg(not(target_os = "macos"))]
+    format!(
+        "no permission to open {subject}. Install the udev rule from the README or run as root."
+    )
+}
 
 /// Open the controller and claim interface 0, detaching `xpad` (it is
 /// reattached when the interface is released).
@@ -181,9 +258,15 @@ pub struct UsbLink {
 impl UsbLink {
     pub fn open(controller: &Controller, trace: bool) -> Result<Self, String> {
         let handle = claim(controller).map_err(|error| match error {
-            rusb::Error::Access => format!(
-                "no permission to open {}. {ACCESS_HINT}",
-                controller.location()
+            rusb::Error::Access => access_error(
+                &controller.location(),
+                controller.vendor_id,
+                controller.product_id,
+            ),
+            rusb::Error::Busy => format!(
+                "{} is in use by another program.{}",
+                controller.location(),
+                holder_hint(controller.vendor_id, controller.product_id)
             ),
             error => format!("could not open {}: {error}", controller.location()),
         })?;
@@ -266,7 +349,9 @@ impl Link for UsbLink {
     /// wait until this connection has dropped: after a reset the old device
     /// lingers for 1-3.6 s, and opening it then fails.
     fn reconnect(&mut self, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let ms = || started.elapsed().as_millis();
         loop {
             match self
                 .packets
@@ -282,6 +367,9 @@ impl Link for UsbLink {
             }
         }
         self.close();
+        if self.trace {
+            eprintln!("reconnect +{} ms: disconnected", ms());
+        }
 
         // On macOS the restarted controller sometimes does not re-enumerate
         // until it is unplugged and plugged back in. Reconnecting matches it
@@ -289,7 +377,15 @@ impl Link for UsbLink {
         let dropped = Instant::now();
         let mut hinted = false;
         let mut last_error = None;
+        let mut seen = None;
         loop {
+            if self.trace {
+                let devices = microsoft_devices();
+                if seen.as_ref() != Some(&devices) {
+                    eprintln!("reconnect +{} ms: devices [{devices}]", ms());
+                    seen = Some(devices);
+                }
+            }
             for controller in find_controllers()?
                 .into_iter()
                 .filter(|c| (c.vendor_id, c.product_id) == self.ids)
@@ -305,7 +401,11 @@ impl Link for UsbLink {
                             continue;
                         }
                         if self.trace {
-                            eprintln!("reconnected at {}", controller.location());
+                            eprintln!(
+                                "reconnect +{} ms: reconnected at {}",
+                                ms(),
+                                controller.location()
+                            );
                         }
                         *self = Self::start(&controller, handle, self.trace)?;
                         return Ok(());
@@ -315,7 +415,16 @@ impl Link for UsbLink {
                         | rusb::Error::Busy
                         | rusb::Error::NoDevice
                         | rusb::Error::Io),
-                    ) => last_error = Some((controller.location(), error)),
+                    ) => {
+                        if self.trace && last_error.as_ref().map(|(_, e)| e) != Some(&error) {
+                            eprintln!(
+                                "reconnect +{} ms: claiming {} failed: {error}",
+                                ms(),
+                                controller.location()
+                            );
+                        }
+                        last_error = Some((controller.location(), error));
+                    }
                     Err(error) => {
                         return Err(format!(
                             "could not reopen {}: {error}",
@@ -333,9 +442,14 @@ impl Link for UsbLink {
             }
             if Instant::now() >= deadline {
                 return Err(match last_error {
-                    Some((location, rusb::Error::Access)) => format!(
-                        "no permission to reopen the restarted controller at {location}. \
-                         {ACCESS_HINT}"
+                    Some((location, rusb::Error::Access)) => access_error(
+                        &format!("the restarted controller at {location}"),
+                        self.ids.0,
+                        self.ids.1,
+                    ),
+                    Some((location, rusb::Error::Busy)) => format!(
+                        "the restarted controller at {location} is in use by another program.{}",
+                        holder_hint(self.ids.0, self.ids.1)
                     ),
                     Some((location, error)) => {
                         format!("could not reopen the restarted controller at {location}: {error}")
