@@ -1,6 +1,6 @@
 ---
 title: Firmware update protocol
-nav_order: 2
+nav_order: 3
 description: "Reverse engineered documentation of the Xbox controller firmware update protocol (UFU over GIP): framing, messages, update sequence, restarts, flash layout and the rdhm package format."
 ---
 
