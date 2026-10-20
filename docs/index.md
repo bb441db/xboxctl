@@ -73,6 +73,9 @@ dependencies; you can also download them from the releases page directly.
 On Linux, install the udev rule below so that `xboxctl` runs without root. On
 macOS, run it with `sudo`; see [Permissions](#permissions).
 
+Using a Steam Deck or another SteamOS device? Follow the
+[step by step guide for SteamOS]({% link steamos.md %}).
+
 ## Usage
 
 ```bash

@@ -86,7 +86,27 @@ say "Installed $("$install_dir/xboxctl" --version) to $install_dir/xboxctl"
 
 case ":$PATH:" in
     *":$install_dir:"*) ;;
-    *) say "Note: $install_dir is not in your PATH; add it to run xboxctl directly." ;;
+    *)
+        say ""
+        say "Note: $install_dir is not in your PATH, so 'xboxctl' will not be found yet."
+        case "$(basename "${SHELL:-sh}")" in
+            fish)
+                say "Add it with:"
+                say ""
+                say "  fish_add_path $install_dir"
+                ;;
+            zsh) rc='~/.zshrc' ;;
+            bash) rc='~/.bashrc' ;;
+            *) rc='~/.profile' ;;
+        esac
+        if [ -n "${rc:-}" ]; then
+            say "Add it with:"
+            say ""
+            say "  echo 'export PATH=\"$install_dir:\$PATH\"' >> $rc"
+            say ""
+            say "then run '. $rc' (or open a new terminal) to use it right away."
+        fi
+        ;;
 esac
 
 if [ "$os" = linux ]; then
