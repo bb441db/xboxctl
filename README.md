@@ -69,6 +69,7 @@ xboxctl download --list            # every model in Microsoft's feed
 xboxctl update --latest --dry-run  # compare the controller with the current firmware
 xboxctl update --latest            # install the current firmware
 xboxctl update <package.bin>       # install an rdhm package file
+xboxctl rumble                     # run each rumble motor briefly (--strength 1-100)
 ```
 
 With several controllers connected, choose one with `--device BUS:ADDRESS`
@@ -84,6 +85,19 @@ that still differ.
 Downloads are checked against the SHA-256 in their file name and cached in the
 user cache directory (`~/.cache/xboxctl/firmware` on Linux, `~/Library/Caches/xboxctl/firmware` on
 macOS). Under `sudo` the files still go to, and belong to, the user who ran it.
+
+### Testing rumble
+
+`xboxctl rumble` talks to the controller directly over USB, so it shows whether
+the motors work regardless of the operating system's driver.
+
+On macOS, wired rumble does not work through the system itself (GameController,
+SDL, browsers and Wine): Apple's wired driver does not forward rumble packets to
+Xbox One, Series X|S and Elite Series 2 controllers (checked on macOS 15.7 and
+reported on 27.0.1). If `xboxctl rumble` moves
+the motors, the controller is fine and the problem is macOS. The bug has been
+reported to Apple as FB25254769; see
+[the notes on the macOS driver](https://bb441db.github.io/xboxctl/macos-driver).
 
 ## Permissions
 

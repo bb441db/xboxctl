@@ -83,6 +83,7 @@ xboxctl download --list            # every model in Microsoft's feed
 xboxctl update --latest --dry-run  # compare the controller with the current firmware
 xboxctl update --latest            # install the current firmware
 xboxctl update <package.bin>       # install an rdhm package file
+xboxctl rumble                     # run each rumble motor briefly (--strength 1-100)
 ```
 
 With several controllers connected, choose one with `--device BUS:ADDRESS`
@@ -97,6 +98,20 @@ Downloads are checked against the SHA-256 in their file name and cached in the
 user cache directory (`~/.cache/xboxctl/firmware` on Linux,
 `~/Library/Caches/xboxctl/firmware` on macOS). Under `sudo` the files still go
 to, and belong to, the user who ran it.
+
+## Testing rumble
+
+`xboxctl rumble` runs the handle motors and then the trigger motors for a second
+each, by talking to the controller directly over USB. It changes nothing on the
+controller. Use it to tell a controller fault from a driver problem: if the
+motors move here but not in a game or browser, the controller is fine. Before
+the test it sends a few zero-strength packets so the controller accepts it on
+repeated runs; see the [rumble notes]({% link protocol.md %}#gip-framing).
+
+Wired rumble does not work through macOS itself for Xbox One, Series X|S and
+Elite Series 2 controllers (checked on macOS 15.7 and reported on 27.0.1), so
+this is the way to check the hardware there. See
+[the notes on the macOS driver]({% link macos-driver.md %}).
 
 ## Permissions
 
@@ -117,7 +132,7 @@ sudo udevadm control --reload && sudo udevadm trigger
 
 A system driver (`XboxUSBDevice`) holds the controller exclusively, and there
 is no udev equivalent for taking it over. Commands that talk to the controller
-(`info`, `update`, ...) must run as root:
+(`info`, `update`, `rumble`, ...) must run as root:
 
 ```bash
 sudo xboxctl info
