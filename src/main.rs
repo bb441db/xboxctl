@@ -91,6 +91,17 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Run each of the controller's rumble motors for a moment, to tell a
+    /// controller fault from a driver problem. Changes nothing on the
+    /// controller. On macOS, run with sudo and see Permissions in the README.
+    Rumble {
+        /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Motor strength, 1 to 100.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(1..=100))]
+        strength: u8,
+    },
     /// Debugging aids (debug builds only).
     #[cfg(debug_assertions)]
     Test {
@@ -156,6 +167,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Rumble { device, strength } => {
+            if let Err(error) = rumble(device.as_deref(), strength, trace_packets) {
+                eprintln!("Rumble test failed: {error}");
+                std::process::exit(1);
+            }
+        }
         #[cfg(debug_assertions)]
         Command::Test {
             action: TestAction::Reset { device },
@@ -166,6 +183,62 @@ fn main() {
             }
         }
     }
+}
+
+/// Run the handle motors, then the trigger motors, for a second each. The
+/// motors are always stopped again, also when a step fails.
+fn rumble(device: Option<&str>, strength: u8, trace: bool) -> Result<(), String> {
+    use crate::gip::{
+        frame::Sequence,
+        rumble::{Motors, packet, resync},
+    };
+
+    let controller = usb::select_controller(device)?;
+    println!("Rumbling {}", describe(&controller));
+    let mut link = UsbLink::open(&controller, trace)?;
+    start_device(&mut link)?;
+
+    let mut sequence = Sequence::default();
+    // The controller ignores rumble whose sequence number is not ahead of the
+    // last one it saw, including one from an earlier run.
+    for packet in resync(&mut sequence) {
+        link.send(&packet)?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let steps = [
+        (
+            "handles",
+            Motors {
+                left_handle: strength,
+                right_handle: strength,
+                ..Motors::OFF
+            },
+        ),
+        (
+            "triggers",
+            Motors {
+                left_trigger: strength,
+                right_trigger: strength,
+                ..Motors::OFF
+            },
+        ),
+    ];
+    let mut run = |link: &mut UsbLink| -> Result<(), String> {
+        for (name, motors) in steps {
+            println!("  {name} at {strength}%");
+            link.send(&packet(sequence.take(), motors))?;
+            std::thread::sleep(Duration::from_secs(1));
+            link.send(&packet(sequence.take(), Motors::OFF))?;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        Ok(())
+    };
+    let result = run(&mut link);
+    // After a failure the first stop may have been skipped; stop again.
+    let stopped = link.send(&packet(sequence.take(), Motors::OFF));
+    result.and(stopped)?;
+    println!("Done. If nothing moved, the controller itself may be at fault.");
+    Ok(())
 }
 
 /// Exercise the restart an update goes through, without writing anything:
