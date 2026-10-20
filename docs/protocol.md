@@ -35,7 +35,10 @@ is a base-128 varint. Relevant flags:
 | `0x40` | first fragment |
 | `0x80` | fragment |
 
-Sequence numbers run from 1 to 255; 0 is skipped.
+Sequence numbers run from 1 to 255; 0 is skipped. A Series X|S controller
+(firmware 5.23) ignores a rumble packet unless its number is ahead of the last
+one it received, compared with wraparound like TCP sequence numbers, and it
+keeps that number after the host program exits; see Rumble below.
 
 - **Acknowledgement** (command `0x01`): `01 20 <seq> 09 | 00 <command> 20 <received:u16> 00 00 <remaining:u16>`.
   The controller requests one for each of its UFU replies (`0c 30 …`), and the
@@ -50,6 +53,24 @@ Sequence numbers run from 1 to 255; 0 is skipped.
   zero-length fragment at offset = total ends the message.
 - **Set Device State** (command `0x05`, one-byte payload): `00` start, `07` reset.
 - **Status** (command `0x03`): a first byte with bits 6–7 clear means powered off.
+- **Rumble** (command `0x09`, flags `00`, nine-byte payload):
+  `00 <motors> <LT> <RT> <left> <right> <duration> <delay> <repeat>`. Motor
+  bits `0x0f` enable all four motors, strengths are 0 to 100, and duration `ff`,
+  delay `00`, repeat `ff` keep running until the next rumble packet, so stop
+  with all strengths 0.
+  `xboxctl rumble` sends it, and the Linux xpad and xone drivers send the same
+  packet (xone uses repeat `eb`). The controller does not acknowledge it.
+
+  Rumble is dropped silently unless its sequence number is ahead of the last one
+  the controller saw, within a window of at least 75 numbers. Observed on a
+  Series X|S, firmware 5.23: after a run that ended at about 125, restarting at
+  100, 60 or 62 did nothing, while 120, 200 and then 10 (across the wrap) worked.
+  A replug forgets the number. A program that restarts at a fixed number
+  therefore works once and then stops working until the next replug. The Linux
+  xpad and xone drivers avoid it by keeping one counter for the whole
+  connection. When a
+  program cannot know the last number, it can first send stop packets whose
+  numbers are 32 apart around the whole cycle, as `xboxctl rumble` does.
 
 ## UFU messages
 

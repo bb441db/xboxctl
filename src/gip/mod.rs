@@ -10,5 +10,6 @@
 pub mod device;
 pub mod frame;
 pub mod rdhm;
+pub mod rumble;
 pub mod ufu;
 pub mod updater;

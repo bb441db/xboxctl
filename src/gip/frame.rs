@@ -12,6 +12,7 @@ pub const CMD_ACK: u8 = 0x01;
 pub const CMD_HELLO: u8 = 0x02;
 pub const CMD_STATUS: u8 = 0x03;
 pub const CMD_SET_DEVICE_STATE: u8 = 0x05;
+pub const CMD_RUMBLE: u8 = 0x09;
 pub const CMD_FIRMWARE: u8 = 0x0c;
 
 pub const STATE_START: u8 = 0x00;
