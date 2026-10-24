@@ -1,3 +1,4 @@
+mod calibrate;
 mod feed;
 mod gip;
 mod holders;
@@ -102,6 +103,23 @@ enum Command {
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(1..=100))]
         strength: u8,
     },
+    /// Recalibrate the controller's thumbsticks with a guided walkthrough, and
+    /// check them afterwards. The controller forgets its current stick
+    /// calibration as soon as you start, so finish all the steps.
+    Calibrate {
+        /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Which stick to calibrate; both are done one after the other.
+        #[arg(long, value_enum, default_value_t = calibrate::StickChoice::Both)]
+        stick: calibrate::StickChoice,
+        /// Show the sticks' current calibration without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Debugging aids (debug builds only).
     #[cfg(debug_assertions)]
     Test {
@@ -170,6 +188,19 @@ fn main() {
         Command::Rumble { device, strength } => {
             if let Err(error) = rumble(device.as_deref(), strength, trace_packets) {
                 eprintln!("Rumble test failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        Command::Calibrate {
+            device,
+            stick,
+            dry_run,
+            yes,
+        } => {
+            if let Err(error) =
+                calibrate::run(device.as_deref(), stick, dry_run, yes, trace_packets)
+            {
+                eprintln!("{error}");
                 std::process::exit(1);
             }
         }

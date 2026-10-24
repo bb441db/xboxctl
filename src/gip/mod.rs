@@ -4,6 +4,7 @@
 //! The UFU protocol was reverse engineered from Windows and verified against
 //! the QEMU-emulated controller and a physical Series X|S controller.
 
+pub mod calibration;
 /// Device side of UFU (simulated flash), used as the controller in tests.
 /// The emulator for manual testing is the QEMU `usb-xbox-gip` device.
 #[cfg(test)]
