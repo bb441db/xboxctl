@@ -176,6 +176,20 @@ u16, then left X, left Y, right X, right Y as i16, Y up) only when something
 changes, so a stick at rest is silent. `xboxctl calibrate` follows the rotations
 and the final check with them.
 
+## Trigger calibration
+
+The same command `0x1e` calibrates the triggers, with mask bit 2 for the left
+trigger and bit 3 for the right one (checked on a Series X|S controller,
+firmware 5.23.6.0). Sub-command `0f` reads and `10` starts, as for the sticks, and
+the controller finishes by itself after about 12 full presses of the trigger.
+
+- **Read reply**: `0f 00 <status>`, then one block per trigger of 6 bytes: the
+  mask, a flag byte (`02` on both triggers), and the little-endian u16 minimum
+  and maximum of the raw reading, for example `04 02 6d 04 df 09`, a range of
+  1133 to 2527. A stick block is 9 bytes, so a reply is read block by block.
+- **Input report**: the triggers are the u16 values at payload bytes 2 to 5,
+  from 0 to 1023, and are only sent when they change.
+
 ## Series X|S controller (`045e:0b12`, MERL) layout
 
 | id | flash address | partition | contents |
