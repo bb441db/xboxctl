@@ -73,6 +73,7 @@ xboxctl update --latest --dry-run  # compare the controller with the current fir
 xboxctl update --latest            # install the current firmware
 xboxctl update <package.bin>       # install an rdhm package file
 xboxctl rumble                     # run each rumble motor briefly (--strength 1-100)
+xboxctl diag                       # controller info, then a live view with stick drift check
 xboxctl calibrate                  # guided thumbstick calibration (--stick left|right|both)
 xboxctl calibrate --dry-run        # show the stored calibration, change nothing
 xboxctl calibrate --trigger both   # guided trigger calibration (--trigger left|right|both)
@@ -105,6 +106,29 @@ the motors, the controller is fine and the problem is macOS. The bug has been
 reported to Apple as FB25254769; see
 [the notes on the macOS driver](https://bb441db.github.io/xboxctl/macos-driver).
 
+### Diagnosing a controller
+
+`xboxctl diag` shows what the controller reports about itself (identity and
+firmware versions) and then opens a live view of the buttons, both sticks and
+both triggers. It changes nothing on the
+controller.
+
+```
+  A LB                      L  +12%   -3%   R   +0%   +0%   LT   0%  RT 100%
+```
+
+The controller only reports changes, so press any button first: that report also
+tells where the sticks rest. Press every button and push the sticks and
+triggers all the way to see if something does not respond. If you leave a stick alone for a few seconds and it
+rests 6% to 30% of its travel away from the centre, the view warns about possible
+stick drift; `xboxctl calibrate` may fix that. A stick that stays further out
+makes the view ask you to let go of it: a stick that does not come back is
+drifting badly. A few percent off-centre (3% to 6%) is only noted in the summary.
+Hold the Xbox button for two seconds to finish, or use `--duration SECONDS`. The summary at the
+end lists the buttons you did not press, the resting state from the first report,
+how far each stick and trigger reached after that ("not moved" if you left it
+alone) and whether either stick drifted.
+
 ### Calibrating the sticks
 
 `xboxctl calibrate` walks you through recalibrating the thumbsticks, like the
@@ -123,8 +147,9 @@ calibration meanwhile). `xboxctl calibrate --dry-run` only shows the stored
 range of each stick.
 
 Checked on an Xbox Series X|S controller (firmware 5.23). Firmware that does not
-support calibration does not answer (a Series X|S on 5.13.3146.0 did not), and
-`xboxctl` says so; `xboxctl update --latest` brings the controller up to date.
+support calibration does not answer (a Series X|S on 5.13.3146.0 did not) or
+refuses (an Xbox One S does, also on its latest firmware, 5.23, which has no
+calibration code), and `xboxctl` says so; `xboxctl update --latest` brings the controller up to date.
 A firmware update leaves the stored calibration alone: it was unchanged after
 going from 5.23 down to 5.13.3146.0 and back.
 
