@@ -1,14 +1,15 @@
-//! `xboxctl calibrate`: a guided thumbstick calibration.
+//! `xboxctl calibrate`: a guided thumbstick and trigger calibration.
 //!
 //! The controller does the work. One request starts a calibration, and the
 //! controller finishes it by itself once the stick has been turned through
 //! its full range. This module guides the user through that, follows it, and
-//! ends with a check that pushes the stick in each direction. See
+//! ends with a check that pushes the stick in each direction (or presses the
+//! trigger). See
 //! `gip::calibration` for the wire format.
 
 use crate::{
     gip::{
-        calibration::{self, Axes, Limits, Response, Sticks},
+        calibration::{self, Axes, Controls, Limits, Response, TriggerLimits, Triggers},
         frame::{self, Packet, Sequence},
         updater::Link,
     },
@@ -24,6 +25,9 @@ use std::{
 
 /// Full circles the wizard asks for in each direction.
 const ROTATIONS: u32 = 6;
+/// Full presses the wizard asks for on a trigger (what the Xbox Accessories
+/// app asks for).
+const PRESSES: u32 = 12;
 /// Calibration status while the controller saves the result.
 const STATUS_SAVING: u8 = 0x10;
 /// No movement for this long ends the calibration with an error.
@@ -41,7 +45,7 @@ const SETTLE: Duration = Duration::from_millis(300);
 const NO_REPLY: &str = "no reply to the calibration request";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum StickChoice {
+pub enum Side {
     Left,
     Right,
     Both,
@@ -61,10 +65,10 @@ impl Stick {
         }
     }
 
-    fn sticks(self) -> Sticks {
-        Sticks {
-            left: self == Self::Left,
-            right: self == Self::Right,
+    fn controls(self) -> Controls {
+        match self {
+            Self::Left => Controls::LEFT_STICK,
+            Self::Right => Controls::RIGHT_STICK,
         }
     }
 
@@ -239,6 +243,119 @@ impl PushCheck {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    Left,
+    Right,
+}
+
+impl Trigger {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    fn controls(self) -> Controls {
+        match self {
+            Self::Left => Controls::LEFT_TRIGGER,
+            Self::Right => Controls::RIGHT_TRIGGER,
+        }
+    }
+
+    fn position(self, triggers: &Triggers) -> u16 {
+        match self {
+            Self::Left => triggers.left,
+            Self::Right => triggers.right,
+        }
+    }
+
+    fn limits(self, response: &Response) -> Option<TriggerLimits> {
+        match (self, response) {
+            (Self::Left, Response::Read { left_trigger, .. }) => *left_trigger,
+            (Self::Right, Response::Read { right_trigger, .. }) => *right_trigger,
+            _ => None,
+        }
+    }
+}
+
+/// Counts the full presses a trigger gets: down to the end, then let go.
+#[derive(Debug, Default)]
+struct PressCounter {
+    down: bool,
+    presses: u32,
+}
+
+impl PressCounter {
+    /// Travel, as a fraction of the full range, from which a trigger counts
+    /// as pressed all the way in.
+    const PRESSED: f64 = 0.9;
+    /// Travel below which a trigger counts as let go.
+    const RELEASED: f64 = 0.1;
+
+    fn feed(&mut self, value: u16) {
+        let fraction = f64::from(value) / f64::from(Triggers::MAX);
+        if !self.down && fraction >= Self::PRESSED {
+            self.down = true;
+        } else if self.down && fraction <= Self::RELEASED {
+            self.down = false;
+            self.presses += 1;
+        }
+    }
+}
+
+/// The check after a trigger calibration, like the app's "Resting" and
+/// "Range" columns: the trigger at rest reads close to 0, and pressed all
+/// the way in it reaches the end of its range.
+#[derive(Debug, Default)]
+struct TriggerCheck {
+    started: bool,
+    peak: f64,
+    last: f64,
+    /// The highest and the last raw reading, for the report.
+    peak_raw: u16,
+    last_raw: u16,
+}
+
+impl TriggerCheck {
+    /// Travel from which the press counts as started.
+    const START: f64 = 0.5;
+    /// Highest reading that still counts as resting.
+    const REST: f64 = 0.04;
+    /// Travel that counts as the end of the range.
+    const REACH: f64 = 0.95;
+    /// Travel below which the trigger may be judged once it stops moving.
+    const RELEASED: f64 = 0.3;
+
+    fn feed(&mut self, value: u16) {
+        let fraction = f64::from(value) / f64::from(Triggers::MAX);
+        self.last = fraction;
+        self.last_raw = value;
+        if fraction >= Self::START {
+            self.started = true;
+        }
+        if self.started {
+            self.peak = self.peak.max(fraction);
+            self.peak_raw = self.peak_raw.max(value);
+        }
+    }
+
+    fn released(&self) -> bool {
+        self.started && self.last < Self::RELEASED
+    }
+
+    /// Reads close to 0 after letting go. The controller only reports changes,
+    /// so there is no reading of the trigger before the press.
+    fn resting(&self) -> bool {
+        self.last <= Self::REST
+    }
+
+    fn reaches_end(&self) -> bool {
+        self.peak >= Self::REACH
+    }
+}
+
 /// One line that is rewritten in place on a terminal, like the update
 /// progress.
 struct Live {
@@ -327,17 +444,21 @@ impl Session {
         Err(NO_REPLY.to_owned())
     }
 
-    fn read(&mut self, sticks: Sticks, other: &mut dyn FnMut(&Packet)) -> Result<Response, String> {
+    fn read(
+        &mut self,
+        controls: Controls,
+        other: &mut dyn FnMut(&Packet),
+    ) -> Result<Response, String> {
         self.exchange(
-            |n| calibration::read_packet(n, sticks),
+            |n| calibration::read_packet(n, controls),
             |r| matches!(r, Response::Read { .. }),
             other,
         )
     }
 
-    fn start(&mut self, sticks: Sticks) -> Result<(), String> {
+    fn start(&mut self, controls: Controls) -> Result<(), String> {
         self.exchange(
-            |n| calibration::recenter_packet(n, sticks),
+            |n| calibration::recenter_packet(n, controls),
             |r| matches!(r, Response::Recenter { .. }),
             &mut |_| {},
         )
@@ -407,9 +528,27 @@ fn describe_limits(limits: Option<Limits>) -> String {
     }
 }
 
+/// Highest calibration status of the given controls; non-zero means a
+/// calibration is still pending.
+fn pending(session: &mut Session, groups: &[Controls]) -> Result<u8, String> {
+    let mut highest = 0;
+    for &controls in groups {
+        highest = highest.max(status(&session.read(controls, &mut |_| {})?));
+    }
+    Ok(highest)
+}
+
+fn describe_trigger_limits(limits: Option<TriggerLimits>) -> String {
+    match limits {
+        Some(l) if l.max != 0 => format!("range {}-{}", l.min, l.max),
+        _ => "no calibration stored (the controller uses its defaults)".to_owned(),
+    }
+}
+
 pub fn run(
     device: Option<&str>,
-    choice: StickChoice,
+    stick: Option<Side>,
+    trigger: Option<Side>,
     dry_run: bool,
     yes: bool,
     trace: bool,
@@ -422,14 +561,30 @@ pub fn run(
         link,
         sequence: Sequence::default(),
     };
-    let sticks: Vec<Stick> = match choice {
-        StickChoice::Left => vec![Stick::Left],
-        StickChoice::Right => vec![Stick::Right],
-        StickChoice::Both => vec![Stick::Left, Stick::Right],
+    // Without a choice, the sticks are calibrated.
+    let stick = stick.or(trigger.is_none().then_some(Side::Both));
+    let sticks: Vec<Stick> = match stick {
+        None => vec![],
+        Some(Side::Left) => vec![Stick::Left],
+        Some(Side::Right) => vec![Stick::Right],
+        Some(Side::Both) => vec![Stick::Left, Stick::Right],
     };
+    let triggers: Vec<Trigger> = match trigger {
+        None => vec![],
+        Some(Side::Left) => vec![Trigger::Left],
+        Some(Side::Right) => vec![Trigger::Right],
+        Some(Side::Both) => vec![Trigger::Left, Trigger::Right],
+    };
+    let mut groups = Vec::new();
+    if !sticks.is_empty() {
+        groups.push(Controls::BOTH_STICKS);
+    }
+    if !triggers.is_empty() {
+        groups.push(Controls::BOTH_TRIGGERS);
+    }
 
     // The controller only answers on firmware that supports calibration.
-    let mut current = session.read(Sticks::BOTH, &mut |_| {}).map_err(|error| {
+    let unsupported = |error: String| {
         if error == NO_REPLY {
             "This controller did not answer the calibration request, so it probably does \
                  not support calibration. Newer firmware might: see `xboxctl update --latest \
@@ -438,7 +593,8 @@ pub fn run(
         } else {
             error
         }
-    })?;
+    };
+    let current = session.read(groups[0], &mut |_| {}).map_err(unsupported)?;
 
     if dry_run {
         for stick in &sticks {
@@ -448,15 +604,24 @@ pub fn run(
                 describe_limits(stick.limits(&current))
             );
         }
+        if !triggers.is_empty() {
+            let response = session.read(Controls::BOTH_TRIGGERS, &mut |_| {})?;
+            for trigger in &triggers {
+                println!(
+                    "{} trigger: {}",
+                    capitalised(trigger.name()),
+                    describe_trigger_limits(trigger.limits(&response))
+                );
+            }
+        }
         println!("Nothing was changed.");
         return Ok(());
     }
 
-    if status(&current) != 0 {
+    if pending(&mut session, &groups).map_err(unsupported)? != 0 {
         println!("An unfinished calibration was found; restarting the controller to clear it.");
         session.restart()?;
-        current = session.read(Sticks::BOTH, &mut |_| {})?;
-        if status(&current) != 0 {
+        if pending(&mut session, &groups)? != 0 {
             return Err(
                 "the controller is still busy with an earlier calibration; unplug it, plug it \
                  in again and try once more"
@@ -465,14 +630,17 @@ pub fn run(
         }
     }
 
-    let names: Vec<&str> = sticks.iter().map(|s| s.name()).collect();
+    let names: Vec<String> = sticks
+        .iter()
+        .map(|s| format!("{} stick", s.name()))
+        .chain(triggers.iter().map(|t| format!("{} trigger", t.name())))
+        .collect();
     if !yes {
         println!(
-            "\nThis recalibrates the {} stick{}, which takes about a minute each.\n\n\
+            "\nThis recalibrates the {}, which takes about a minute each.\n\n\
              The controller forgets its current calibration as soon as you start, so please \
-             finish all the steps. Keep the sticks untouched until you are asked to move them.",
+             finish all the steps. Keep the controls untouched until you are asked to use them.",
             names.join(" and "),
-            if sticks.len() > 1 { "s" } else { "" },
         );
         print!("\nType 'calibrate' to continue: ");
         io::stdout().flush().ok();
@@ -487,7 +655,8 @@ pub fn run(
     }
 
     let mut live = Live::new();
-    let mut problems = Vec::new();
+    // The controls whose check found a problem, with the flag that runs them again.
+    let mut problems: Vec<(String, String)> = Vec::new();
     for stick in sticks {
         calibrate_stick(&mut session, stick, &mut live).map_err(|error| {
             format!(
@@ -502,7 +671,26 @@ pub fn run(
             .iter()
             .any(|(_, outcome)| *outcome != Outcome::Pass)
         {
-            problems.push(stick.name());
+            problems.push((
+                format!("{} stick", stick.name()),
+                format!("--stick {}", stick.name()),
+            ));
+        }
+    }
+    for trigger in triggers {
+        calibrate_trigger(&mut session, trigger, &mut live).map_err(|error| {
+            format!(
+                "{error}\nThe {} trigger was not calibrated, and the controller may now have no \
+                 calibration stored for it. Run `xboxctl calibrate --trigger {}` again to finish.",
+                trigger.name(),
+                trigger.name()
+            )
+        })?;
+        if !check_trigger(&mut session, trigger, &mut live)? {
+            problems.push((
+                format!("{} trigger", trigger.name()),
+                format!("--trigger {}", trigger.name()),
+            ));
         }
     }
 
@@ -510,11 +698,12 @@ pub fn run(
     if problems.is_empty() {
         println!("Done. Your controller is calibrated and the check passed.");
     } else {
+        let labels: Vec<&str> = problems.iter().map(|(label, _)| label.as_str()).collect();
         println!(
-            "Calibration is done, but the check found a problem with the {} stick. You can run \
-             `xboxctl calibrate --stick {}` again.",
-            problems.join(" and "),
-            problems[0]
+            "Calibration is done, but the check found a problem with the {}. You can run \
+             `xboxctl calibrate {}` again.",
+            labels.join(" and "),
+            problems[0].1
         );
     }
     Ok(())
@@ -538,9 +727,9 @@ fn count(counter: &mut RotationCounter, stick: Stick, packet: &Packet) {
 /// Steps 1 and 2: rotate clockwise, then counter-clockwise, until the
 /// controller says it is done.
 fn calibrate_stick(session: &mut Session, stick: Stick, live: &mut Live) -> Result<(), String> {
-    let sticks = stick.sticks();
+    let controls = stick.controls();
     println!("\nCalibrating the {} stick", stick.name());
-    session.start(sticks)?;
+    session.start(controls)?;
 
     println!("\nStep 1 of 3: turn the stick clockwise");
     println!("  Push it to the outer edge and draw {ROTATIONS} full circles.");
@@ -555,7 +744,7 @@ fn calibrate_stick(session: &mut Session, stick: Stick, live: &mut Live) -> Resu
     let mut finishing = None;
 
     loop {
-        let response = session.read(sticks, &mut |p| count(&mut counter, stick, p))?;
+        let response = session.read(controls, &mut |p| count(&mut counter, stick, p))?;
         let status = status(&response);
         seen_active |= status != 0;
         if seen_active && status == 0 {
@@ -611,7 +800,7 @@ fn calibrate_stick(session: &mut Session, stick: Stick, live: &mut Live) -> Resu
     live.done(&format!("  \u{2713} Rotations: {ROTATIONS}/{ROTATIONS}"));
 
     // The controller reports success by going quiet; make sure it kept limits.
-    let response = session.read(sticks, &mut |_| {})?;
+    let response = session.read(controls, &mut |_| {})?;
     if describe_limits(stick.limits(&response)).starts_with("no calibration") {
         return Err("the controller finished without storing a calibration".to_owned());
     }
@@ -680,6 +869,145 @@ fn wait_for_push(
             return Ok(Outcome::NoMovement);
         }
     }
+}
+
+fn press(counter: &mut PressCounter, trigger: Trigger, packet: &Packet) {
+    if let Some(triggers) = Triggers::parse(packet) {
+        counter.feed(trigger.position(&triggers));
+    }
+}
+
+/// Step 1: press the trigger all the way in a number of times, until the
+/// controller says it is done.
+fn calibrate_trigger(
+    session: &mut Session,
+    trigger: Trigger,
+    live: &mut Live,
+) -> Result<(), String> {
+    let controls = trigger.controls();
+    println!("\nCalibrating the {} trigger", trigger.name());
+    session.start(controls)?;
+
+    println!("\nStep 1 of 2: press the trigger");
+    println!("  Press it all the way in and let go, {PRESSES} times.");
+    live.show(&format!("  Presses: 0/{PRESSES}"));
+
+    let mut counter = PressCounter::default();
+    let mut seen_active = false;
+    let mut last_progress = Instant::now();
+    let mut shown = 0;
+    let mut finishing = None;
+
+    loop {
+        let response = session.read(controls, &mut |p| press(&mut counter, trigger, p))?;
+        let status = status(&response);
+        seen_active |= status != 0;
+        if seen_active && status == 0 {
+            break;
+        }
+        if !seen_active && counter.presses == 0 && last_progress.elapsed() > Duration::from_secs(5)
+        {
+            return Err("the controller did not start the calibration".to_owned());
+        }
+
+        let done = counter.presses.min(PRESSES);
+        if done != shown {
+            shown = done;
+            last_progress = Instant::now();
+        }
+        if status == STATUS_SAVING {
+            live.show("  Saving...");
+        } else {
+            live.show(&format!("  Presses: {done}/{PRESSES}"));
+        }
+        if done >= PRESSES {
+            finishing.get_or_insert_with(Instant::now);
+        }
+        if finishing.is_some_and(|since| since.elapsed() > FINISH_LIMIT) {
+            return Err(if seen_active {
+                "the controller did not finish the calibration".to_owned()
+            } else {
+                "the controller never reported a calibration in progress".to_owned()
+            });
+        }
+        if last_progress.elapsed() > IDLE_LIMIT {
+            return Err("no trigger movement for three minutes".to_owned());
+        }
+        session.pump(Duration::from_millis(300), &mut |p| {
+            press(&mut counter, trigger, p)
+        })?;
+    }
+    live.done(&format!("  \u{2713} Presses: {PRESSES}/{PRESSES}"));
+
+    let response = session.read(controls, &mut |_| {})?;
+    match trigger.limits(&response) {
+        Some(l) if l.max != 0 => println!("  Stored: {}", describe_trigger_limits(Some(l))),
+        _ => println!("  Note: the controller reports no stored calibration."),
+    }
+    Ok(())
+}
+
+/// Step 2: judge the resting position and the range, as the app does, from
+/// one full press. Returns whether both are fine.
+fn check_trigger(session: &mut Session, trigger: Trigger, live: &mut Live) -> Result<bool, String> {
+    println!("\nStep 2 of 2: check the {} trigger", trigger.name());
+    live.show("  Leave it alone, then press it all the way in and let go");
+    let mut check = TriggerCheck::default();
+    let began = Instant::now();
+    let mut started_at = None;
+    let mut last_report = Instant::now();
+    loop {
+        session.pump(Duration::from_millis(100), &mut |packet| {
+            if let Some(triggers) = Triggers::parse(packet) {
+                check.feed(trigger.position(&triggers));
+                last_report = Instant::now();
+            }
+        })?;
+        if check.started {
+            let since = *started_at.get_or_insert_with(Instant::now);
+            if (check.released() && last_report.elapsed() >= SETTLE)
+                || since.elapsed() >= PUSH_LIMIT
+            {
+                break;
+            }
+        } else if began.elapsed() >= PUSH_WAIT {
+            live.done("  - skipped, no movement seen");
+            return Ok(false);
+        }
+    }
+    live.done("  Done");
+    let mark = |ok| if ok { "\u{2713}" } else { "\u{2717}" };
+    println!(
+        "  {} Resting: {}",
+        mark(check.resting()),
+        if check.resting() {
+            format!("at rest it reads {} (of {})", check.last_raw, Triggers::MAX)
+        } else {
+            format!(
+                "at rest it reads {} (of {}), not close to zero",
+                check.last_raw,
+                Triggers::MAX
+            )
+        }
+    );
+    println!(
+        "  {} Range: {}",
+        mark(check.reaches_end()),
+        if check.reaches_end() {
+            format!(
+                "fully pressed it reads {} (of {})",
+                check.peak_raw,
+                Triggers::MAX
+            )
+        } else {
+            format!(
+                "fully pressed it only reads {} (of {})",
+                check.peak_raw,
+                Triggers::MAX
+            )
+        }
+    );
+    Ok(check.resting() && check.reaches_end())
 }
 
 #[cfg(test)]
@@ -798,5 +1126,70 @@ mod tests {
         };
         assert!(describe_limits(Some(empty)).starts_with("no calibration"));
         assert!(describe_limits(None).starts_with("no calibration"));
+    }
+
+    #[test]
+    fn trigger_limits_are_described_for_people() {
+        let limits = TriggerLimits {
+            flag: 2,
+            min: 1134,
+            max: 2527,
+        };
+        assert_eq!(describe_trigger_limits(Some(limits)), "range 1134-2527");
+        let empty = TriggerLimits {
+            flag: 2,
+            min: 0,
+            max: 0,
+        };
+        assert!(describe_trigger_limits(Some(empty)).starts_with("no calibration"));
+        assert!(describe_trigger_limits(None).starts_with("no calibration"));
+    }
+
+    #[test]
+    fn counts_trigger_presses() {
+        let mut counter = PressCounter::default();
+        for _ in 0..3 {
+            for value in [0, 300, 1023, 600, 40] {
+                counter.feed(value);
+            }
+        }
+        assert_eq!(counter.presses, 3);
+        // A half press, or holding it down, is not a press.
+        counter.feed(500);
+        counter.feed(0);
+        counter.feed(1023);
+        assert_eq!(counter.presses, 3);
+    }
+
+    fn trigger_check(values: &[u16]) -> TriggerCheck {
+        let mut check = TriggerCheck::default();
+        for &value in values {
+            check.feed(value);
+        }
+        check
+    }
+
+    #[test]
+    fn a_clean_trigger_press_passes() {
+        let check = trigger_check(&[0, 400, 1000, 1023, 300, 0]);
+        assert!(check.released());
+        assert!(check.resting());
+        assert!(check.reaches_end());
+    }
+
+    #[test]
+    fn a_trigger_that_does_not_reach_the_end_fails_the_range() {
+        let check = trigger_check(&[0, 600, 800, 0]);
+        assert!(check.resting());
+        assert!(!check.reaches_end());
+    }
+
+    #[test]
+    fn a_trigger_that_rests_above_zero_fails_the_resting_check() {
+        let check = trigger_check(&[0, 1023, 120]);
+        assert!(!check.resting());
+        assert!(check.reaches_end());
+        // The first reading of a press is part of the ramp, not the rest.
+        assert!(trigger_check(&[90, 400, 1023, 0]).resting());
     }
 }

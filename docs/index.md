@@ -88,7 +88,8 @@ xboxctl update --latest            # install the current firmware
 xboxctl update <package.bin>       # install an rdhm package file
 xboxctl rumble                     # run each rumble motor briefly (--strength 1-100)
 xboxctl calibrate                  # guided thumbstick calibration (--stick left|right|both)
-xboxctl calibrate --dry-run        # show the stored stick calibration, change nothing
+xboxctl calibrate --dry-run        # show the stored calibration, change nothing
+xboxctl calibrate --trigger both   # guided trigger calibration (--trigger left|right|both)
 ```
 
 With several controllers connected, choose one with `--device BUS:ADDRESS`
@@ -140,6 +141,17 @@ support calibration does not answer (a Series X|S on 5.13.3146.0 did not), and
 `xboxctl` says so; `xboxctl update --latest` brings the controller up to date.
 A firmware update leaves the stored calibration alone: it was unchanged after
 going from 5.23 down to 5.13.3146.0 and back.
+
+## Calibrating the triggers
+
+`xboxctl calibrate --trigger left|right|both` is the same for the triggers: it
+asks for 12 full presses (what the Xbox Accessories app asks for), follows them,
+and then checks that the trigger reads zero at rest and reaches the end of its
+range when fully pressed. Checked on an Xbox Series X|S controller (firmware
+5.23): the controller learns the range itself and stores it, and the result
+stays after a power cycle, as for the sticks.
+`xboxctl calibrate --trigger both --dry-run` only reads, and prints the stored
+range of each trigger with the raw replies.
 
 ## Permissions
 
