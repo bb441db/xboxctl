@@ -1,0 +1,802 @@
+//! `xboxctl calibrate`: a guided thumbstick calibration.
+//!
+//! The controller does the work. One request starts a calibration, and the
+//! controller finishes it by itself once the stick has been turned through
+//! its full range. This module guides the user through that, follows it, and
+//! ends with a check that pushes the stick in each direction. See
+//! `gip::calibration` for the wire format.
+
+use crate::{
+    gip::{
+        calibration::{self, Axes, Limits, Response, Sticks},
+        frame::{self, Packet, Sequence},
+        updater::Link,
+    },
+    start_device,
+    usb::{self, UsbLink},
+};
+use clap::ValueEnum;
+use std::{
+    f64::consts::{PI, TAU},
+    io::{self, BufRead, IsTerminal, Write},
+    time::{Duration, Instant},
+};
+
+/// Full circles the wizard asks for in each direction.
+const ROTATIONS: u32 = 6;
+/// Calibration status while the controller saves the result.
+const STATUS_SAVING: u8 = 0x10;
+/// No movement for this long ends the calibration with an error.
+const IDLE_LIMIT: Duration = Duration::from_secs(180);
+/// How long the controller may take to finish after the last rotation.
+const FINISH_LIMIT: Duration = Duration::from_secs(20);
+/// How long to wait for the user to start each push of the check.
+const PUSH_WAIT: Duration = Duration::from_secs(30);
+/// How long a push may take from start to rest before it is judged anyway.
+const PUSH_LIMIT: Duration = Duration::from_secs(10);
+/// No input report for this long means the stick has stopped moving; the
+/// controller only reports changes.
+const SETTLE: Duration = Duration::from_millis(300);
+
+const NO_REPLY: &str = "no reply to the calibration request";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StickChoice {
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stick {
+    Left,
+    Right,
+}
+
+impl Stick {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    fn sticks(self) -> Sticks {
+        Sticks {
+            left: self == Self::Left,
+            right: self == Self::Right,
+        }
+    }
+
+    fn position(self, axes: &Axes) -> (i16, i16) {
+        match self {
+            Self::Left => (axes.left_x, axes.left_y),
+            Self::Right => (axes.right_x, axes.right_y),
+        }
+    }
+
+    fn limits(self, response: &Response) -> Option<Limits> {
+        match (self, response) {
+            (Self::Left, Response::Read { left, .. }) => *left,
+            (Self::Right, Response::Read { right, .. }) => *right,
+            _ => None,
+        }
+    }
+}
+
+/// Counts the rotations a stick makes at its outer edge, in each direction.
+#[derive(Debug, Default)]
+struct RotationCounter {
+    last_angle: Option<f64>,
+    clockwise: f64,
+    counter_clockwise: f64,
+}
+
+impl RotationCounter {
+    /// Stick radius, as a fraction of full travel, from which it counts as
+    /// being at the outer edge.
+    const EDGE: f64 = 0.85;
+    /// Angle changes smaller than this (radians) are noise.
+    const MIN_STEP: f64 = 0.02;
+
+    fn feed(&mut self, x: i16, y: i16) {
+        let (x, y) = (f64::from(x) / 32768.0, f64::from(y) / 32768.0);
+        if x.hypot(y) < Self::EDGE {
+            self.last_angle = None;
+            return;
+        }
+        // Y is up, so the angle grows counter-clockwise.
+        let angle = y.atan2(x);
+        if let Some(last) = self.last_angle {
+            let mut step = angle - last;
+            if step > PI {
+                step -= TAU;
+            } else if step < -PI {
+                step += TAU;
+            }
+            if step.abs() >= Self::MIN_STEP {
+                if step < 0.0 {
+                    self.clockwise -= step;
+                } else {
+                    self.counter_clockwise += step;
+                }
+            }
+        }
+        self.last_angle = Some(angle);
+    }
+
+    /// Complete turns so far: (clockwise, counter-clockwise).
+    fn turns(&self) -> (f64, f64) {
+        (self.clockwise / TAU, self.counter_clockwise / TAU)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Up,
+    Right,
+    Down,
+    Left,
+}
+
+impl Direction {
+    const ALL: [Self; 4] = [Self::Up, Self::Right, Self::Down, Self::Left];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Right => "right",
+            Self::Down => "down",
+            Self::Left => "left",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Up => "Up",
+            Self::Right => "Right",
+            Self::Down => "Down",
+            Self::Left => "Left",
+        }
+    }
+
+    /// How far a position (-1 to 1 on each axis, Y up) is in this direction.
+    fn along(self, x: f64, y: f64) -> f64 {
+        match self {
+            Self::Up => y,
+            Self::Down => -y,
+            Self::Right => x,
+            Self::Left => -x,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Pass,
+    ShortOfEdge,
+    OffCentre,
+    NoMovement,
+}
+
+/// One push of the check: all the way in a direction, then let go.
+#[derive(Debug)]
+struct PushCheck {
+    direction: Direction,
+    started: bool,
+    peak: f64,
+    last: (f64, f64),
+}
+
+impl PushCheck {
+    /// Travel in the direction from which the push counts as started.
+    const START: f64 = 0.5;
+    /// Travel in the direction that counts as reaching the edge.
+    const REACH: f64 = 0.9;
+    /// Distance from the centre, as a fraction of full travel, that still
+    /// counts as back at rest.
+    const CENTRE: f64 = 0.06;
+    /// Distance from the centre below which the stick may be judged once it
+    /// stops moving.
+    const RELEASED: f64 = 0.3;
+
+    fn new(direction: Direction) -> Self {
+        Self {
+            direction,
+            started: false,
+            peak: 0.0,
+            last: (0.0, 0.0),
+        }
+    }
+
+    fn feed(&mut self, x: i16, y: i16) {
+        let (x, y) = (f64::from(x) / 32768.0, f64::from(y) / 32768.0);
+        self.last = (x, y);
+        let along = self.direction.along(x, y);
+        if along >= Self::START {
+            self.started = true;
+        }
+        if self.started {
+            self.peak = self.peak.max(along);
+        }
+    }
+
+    /// The stick was pushed and has come back close enough to rest to judge.
+    fn released(&self) -> bool {
+        self.started && self.last.0.hypot(self.last.1) < Self::RELEASED
+    }
+
+    fn outcome(&self) -> Outcome {
+        if !self.started {
+            Outcome::NoMovement
+        } else if self.peak < Self::REACH {
+            Outcome::ShortOfEdge
+        } else if self.last.0.hypot(self.last.1) > Self::CENTRE {
+            Outcome::OffCentre
+        } else {
+            Outcome::Pass
+        }
+    }
+}
+
+/// One line that is rewritten in place on a terminal, like the update
+/// progress.
+struct Live {
+    terminal: bool,
+    width: Option<usize>,
+    last: String,
+}
+
+impl Live {
+    fn new() -> Self {
+        Self {
+            terminal: io::stdout().is_terminal(),
+            width: None,
+            last: String::new(),
+        }
+    }
+
+    fn show(&mut self, text: &str) {
+        if text == self.last {
+            return;
+        }
+        self.last = text.to_owned();
+        if self.terminal {
+            let width = self.width.unwrap_or(0);
+            print!("\r{text:<width$}");
+            io::stdout().flush().ok();
+            self.width = Some(text.chars().count());
+        } else {
+            println!("{text}");
+        }
+    }
+
+    /// Replace the line with its final text and move on.
+    fn done(&mut self, text: &str) {
+        if self.terminal {
+            let width = self.width.take().unwrap_or(0);
+            println!("\r{text:<width$}");
+        } else if text != self.last {
+            println!("{text}");
+        }
+        self.last.clear();
+    }
+}
+
+struct Session {
+    link: UsbLink,
+    sequence: Sequence,
+}
+
+impl Session {
+    fn ack(&mut self, packet: &Packet) -> Result<(), String> {
+        if packet.wants_ack() {
+            let received = packet.payload.len() as u32;
+            self.link.send(&frame::ack(packet, received, 0))?;
+        }
+        Ok(())
+    }
+
+    /// Send a request and wait for the reply `wanted`. Everything else the
+    /// controller sends meanwhile (input reports, calibration events) goes to
+    /// `other`, after answering the ACK it asks for.
+    fn exchange(
+        &mut self,
+        request: impl Fn(u8) -> Vec<u8>,
+        wanted: fn(&Response) -> bool,
+        other: &mut dyn FnMut(&Packet),
+    ) -> Result<Response, String> {
+        const ATTEMPTS: usize = 2;
+        for _ in 0..ATTEMPTS {
+            self.link.send(&request(self.sequence.take()))?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while let Some(bytes) = self
+                .link
+                .recv(deadline.saturating_duration_since(Instant::now()))?
+            {
+                let Some(packet) = Packet::parse(&bytes) else {
+                    continue;
+                };
+                self.ack(&packet)?;
+                match Response::parse(&packet) {
+                    Some(response) if wanted(&response) => return Ok(response),
+                    _ => other(&packet),
+                }
+            }
+        }
+        Err(NO_REPLY.to_owned())
+    }
+
+    fn read(&mut self, sticks: Sticks, other: &mut dyn FnMut(&Packet)) -> Result<Response, String> {
+        self.exchange(
+            |n| calibration::read_packet(n, sticks),
+            |r| matches!(r, Response::Read { .. }),
+            other,
+        )
+    }
+
+    fn start(&mut self, sticks: Sticks) -> Result<(), String> {
+        self.exchange(
+            |n| calibration::recenter_packet(n, sticks),
+            |r| matches!(r, Response::Recenter { .. }),
+            &mut |_| {},
+        )
+        .map(|_| ())
+    }
+
+    /// Keep answering the controller for `window`, passing on what it sends.
+    fn pump(&mut self, window: Duration, other: &mut dyn FnMut(&Packet)) -> Result<(), String> {
+        let deadline = Instant::now() + window;
+        while let Some(bytes) = self
+            .link
+            .recv(deadline.saturating_duration_since(Instant::now()))?
+        {
+            if let Some(packet) = Packet::parse(&bytes) {
+                self.ack(&packet)?;
+                other(&packet);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restart the controller with the GIP reset and wait until it answers
+    /// again. A calibration that was left unfinished does not survive this.
+    fn restart(&mut self) -> Result<(), String> {
+        self.link.send(&frame::packet(
+            frame::CMD_SET_DEVICE_STATE,
+            frame::FLAG_SYSTEM,
+            0x02,
+            &[frame::STATE_RESET],
+        ))?;
+        // The power-off status, or a dropped link, says the reset happened.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(bytes)) = self
+            .link
+            .recv(deadline.saturating_duration_since(Instant::now()))
+        {
+            let off = Packet::parse(&bytes).is_some_and(|packet| {
+                packet.command == frame::CMD_STATUS
+                    && packet.payload.first().is_some_and(|s| s & 0xc0 == 0)
+            });
+            if off {
+                break;
+            }
+        }
+        self.link.reconnect(Duration::from_secs(30))?;
+        start_device(&mut self.link)?;
+        self.sequence = Sequence::default();
+        std::thread::sleep(Duration::from_secs(1));
+        Ok(())
+    }
+}
+
+fn status(response: &Response) -> u8 {
+    match response {
+        Response::Read { status, .. } => *status,
+        Response::Recenter { .. } => 0,
+    }
+}
+
+fn describe_limits(limits: Option<Limits>) -> String {
+    match limits {
+        Some(l) if l.horizontal_max != 0 || l.vertical_max != 0 => format!(
+            "horizontal {}-{}, vertical {}-{}",
+            l.horizontal_min, l.horizontal_max, l.vertical_min, l.vertical_max
+        ),
+        _ => "no calibration stored (the controller uses its defaults)".to_owned(),
+    }
+}
+
+pub fn run(
+    device: Option<&str>,
+    choice: StickChoice,
+    dry_run: bool,
+    yes: bool,
+    trace: bool,
+) -> Result<(), String> {
+    let controller = usb::select_controller(device)?;
+    println!("{} ({})", controller.model().0, controller.location());
+    let mut link = UsbLink::open(&controller, trace)?;
+    start_device(&mut link)?;
+    let mut session = Session {
+        link,
+        sequence: Sequence::default(),
+    };
+    let sticks: Vec<Stick> = match choice {
+        StickChoice::Left => vec![Stick::Left],
+        StickChoice::Right => vec![Stick::Right],
+        StickChoice::Both => vec![Stick::Left, Stick::Right],
+    };
+
+    // The controller only answers on firmware that supports calibration.
+    let mut current = session.read(Sticks::BOTH, &mut |_| {}).map_err(|error| {
+        if error == NO_REPLY {
+            "This controller did not answer the calibration request, so it probably does \
+                 not support calibration. Newer firmware might: see `xboxctl update --latest \
+                 --dry-run`."
+                .to_owned()
+        } else {
+            error
+        }
+    })?;
+
+    if dry_run {
+        for stick in &sticks {
+            println!(
+                "{} stick: {}",
+                capitalised(stick.name()),
+                describe_limits(stick.limits(&current))
+            );
+        }
+        println!("Nothing was changed.");
+        return Ok(());
+    }
+
+    if status(&current) != 0 {
+        println!("An unfinished calibration was found; restarting the controller to clear it.");
+        session.restart()?;
+        current = session.read(Sticks::BOTH, &mut |_| {})?;
+        if status(&current) != 0 {
+            return Err(
+                "the controller is still busy with an earlier calibration; unplug it, plug it \
+                 in again and try once more"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let names: Vec<&str> = sticks.iter().map(|s| s.name()).collect();
+    if !yes {
+        println!(
+            "\nThis recalibrates the {} stick{}, which takes about a minute each.\n\n\
+             The controller forgets its current calibration as soon as you start, so please \
+             finish all the steps. Keep the sticks untouched until you are asked to move them.",
+            names.join(" and "),
+            if sticks.len() > 1 { "s" } else { "" },
+        );
+        print!("\nType 'calibrate' to continue: ");
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        if answer.trim() != "calibrate" {
+            return Err("cancelled".to_owned());
+        }
+    }
+
+    let mut live = Live::new();
+    let mut problems = Vec::new();
+    for stick in sticks {
+        calibrate_stick(&mut session, stick, &mut live).map_err(|error| {
+            format!(
+                "{error}\nThe {} stick was not calibrated, and the controller now has no \
+                 calibration stored for it. Run `xboxctl calibrate --stick {}` again to finish.",
+                stick.name(),
+                stick.name()
+            )
+        })?;
+        let outcomes = check_stick(&mut session, stick, &mut live)?;
+        if outcomes
+            .iter()
+            .any(|(_, outcome)| *outcome != Outcome::Pass)
+        {
+            problems.push(stick.name());
+        }
+    }
+
+    println!();
+    if problems.is_empty() {
+        println!("Done. Your controller is calibrated and the check passed.");
+    } else {
+        println!(
+            "Calibration is done, but the check found a problem with the {} stick. You can run \
+             `xboxctl calibrate --stick {}` again.",
+            problems.join(" and "),
+            problems[0]
+        );
+    }
+    Ok(())
+}
+
+fn capitalised(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
+
+fn count(counter: &mut RotationCounter, stick: Stick, packet: &Packet) {
+    if let Some(axes) = Axes::parse(packet) {
+        let (x, y) = stick.position(&axes);
+        counter.feed(x, y);
+    }
+}
+
+/// Steps 1 and 2: rotate clockwise, then counter-clockwise, until the
+/// controller says it is done.
+fn calibrate_stick(session: &mut Session, stick: Stick, live: &mut Live) -> Result<(), String> {
+    let sticks = stick.sticks();
+    println!("\nCalibrating the {} stick", stick.name());
+    session.start(sticks)?;
+
+    println!("\nStep 1 of 3: turn the stick clockwise");
+    println!("  Push it to the outer edge and draw {ROTATIONS} full circles.");
+    live.show(&format!("  Rotations: 0/{ROTATIONS}"));
+
+    let mut counter = RotationCounter::default();
+    let mut clockwise_step = true;
+    let mut counter_clockwise_from = 0.0;
+    let mut seen_active = false;
+    let mut last_progress = Instant::now();
+    let mut shown = 0;
+    let mut finishing = None;
+
+    loop {
+        let response = session.read(sticks, &mut |p| count(&mut counter, stick, p))?;
+        let status = status(&response);
+        seen_active |= status != 0;
+        if seen_active && status == 0 {
+            break;
+        }
+        if !seen_active && last_progress.elapsed() > Duration::from_secs(5) {
+            return Err("the controller did not start the calibration".to_owned());
+        }
+
+        let (clockwise, counter_clockwise) = counter.turns();
+        let done = if clockwise_step {
+            clockwise as u32
+        } else {
+            (counter_clockwise - counter_clockwise_from).max(0.0) as u32
+        }
+        .min(ROTATIONS);
+        if done != shown {
+            shown = done;
+            last_progress = Instant::now();
+        }
+        if status == STATUS_SAVING {
+            live.show("  Saving...");
+        } else {
+            live.show(&format!("  Rotations: {done}/{ROTATIONS}"));
+        }
+        if clockwise_step && done >= ROTATIONS {
+            live.done(&format!("  \u{2713} Rotations: {ROTATIONS}/{ROTATIONS}"));
+            println!("\nStep 2 of 3: now turn it counter-clockwise");
+            println!("  Again {ROTATIONS} full circles at the outer edge.");
+            clockwise_step = false;
+            counter_clockwise_from = counter_clockwise;
+            shown = 0;
+            last_progress = Instant::now();
+            live.show(&format!("  Rotations: 0/{ROTATIONS}"));
+        } else if !clockwise_step && done >= ROTATIONS {
+            finishing.get_or_insert_with(Instant::now);
+        }
+        if finishing.is_some_and(|since| since.elapsed() > FINISH_LIMIT) {
+            return Err("the controller did not finish the calibration".to_owned());
+        }
+        if last_progress.elapsed() > IDLE_LIMIT {
+            return Err("no stick movement for three minutes".to_owned());
+        }
+        session.pump(Duration::from_millis(300), &mut |p| {
+            count(&mut counter, stick, p)
+        })?;
+    }
+
+    if clockwise_step {
+        live.done(&format!("  \u{2713} Rotations: {ROTATIONS}/{ROTATIONS}"));
+        println!("\nStep 2 of 3: counter-clockwise");
+    }
+    live.done(&format!("  \u{2713} Rotations: {ROTATIONS}/{ROTATIONS}"));
+
+    // The controller reports success by going quiet; make sure it kept limits.
+    let response = session.read(sticks, &mut |_| {})?;
+    if describe_limits(stick.limits(&response)).starts_with("no calibration") {
+        return Err("the controller finished without storing a calibration".to_owned());
+    }
+    Ok(())
+}
+
+/// Step 3: push the stick in each direction and let go, and judge each push.
+fn check_stick(
+    session: &mut Session,
+    stick: Stick,
+    live: &mut Live,
+) -> Result<Vec<(Direction, Outcome)>, String> {
+    println!("\nStep 3 of 3: check the {} stick", stick.name());
+    println!("  Push the stick all the way in each direction, then let go.");
+    let mut outcomes = Vec::new();
+    for direction in Direction::ALL {
+        live.show(&format!(
+            "  {}: push the stick all the way {}, then let go",
+            direction.label(),
+            direction.name()
+        ));
+        let outcome = wait_for_push(session, stick, direction)?;
+        let line = match outcome {
+            Outcome::Pass => format!("  \u{2713} {}", direction.label()),
+            Outcome::ShortOfEdge => format!(
+                "  \u{2717} {}: the stick did not reach the edge",
+                direction.label()
+            ),
+            Outcome::OffCentre => format!(
+                "  \u{2717} {}: the stick did not come back to the centre",
+                direction.label()
+            ),
+            Outcome::NoMovement => format!("  - {}: skipped, no movement seen", direction.label()),
+        };
+        live.done(&line);
+        outcomes.push((direction, outcome));
+    }
+    Ok(outcomes)
+}
+
+fn wait_for_push(
+    session: &mut Session,
+    stick: Stick,
+    direction: Direction,
+) -> Result<Outcome, String> {
+    let mut check = PushCheck::new(direction);
+    let began = Instant::now();
+    let mut started_at = None;
+    let mut last_report = Instant::now();
+    loop {
+        session.pump(Duration::from_millis(100), &mut |packet| {
+            if let Some(axes) = Axes::parse(packet) {
+                let (x, y) = stick.position(&axes);
+                check.feed(x, y);
+                last_report = Instant::now();
+            }
+        })?;
+        if check.started {
+            let since = *started_at.get_or_insert_with(Instant::now);
+            if (check.released() && last_report.elapsed() >= SETTLE)
+                || since.elapsed() >= PUSH_LIMIT
+            {
+                return Ok(check.outcome());
+            }
+        } else if began.elapsed() >= PUSH_WAIT {
+            return Ok(Outcome::NoMovement);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stick at full deflection moving through `turns` turns; negative is
+    /// clockwise (Y is up).
+    fn circle(counter: &mut RotationCounter, turns: f64) {
+        let steps = (turns.abs() * 120.0) as usize;
+        for i in 0..=steps {
+            let angle = turns.signum() * TAU * i as f64 / 120.0;
+            counter.feed(
+                (angle.cos() * 32000.0) as i16,
+                (angle.sin() * 32000.0) as i16,
+            );
+        }
+    }
+
+    #[test]
+    fn counts_clockwise_and_counter_clockwise_rotations() {
+        let mut counter = RotationCounter::default();
+        circle(&mut counter, -6.0);
+        let (clockwise, counter_clockwise) = counter.turns();
+        assert!((5.9..=6.1).contains(&clockwise), "{clockwise}");
+        assert!(counter_clockwise < 0.1);
+        counter.feed(0, 0);
+        circle(&mut counter, 6.0);
+        let (clockwise, counter_clockwise) = counter.turns();
+        assert!((5.9..=6.1).contains(&clockwise), "{clockwise}");
+        assert!(
+            (5.9..=6.1).contains(&counter_clockwise),
+            "{counter_clockwise}"
+        );
+    }
+
+    #[test]
+    fn a_wobble_near_the_centre_counts_nothing() {
+        let mut counter = RotationCounter::default();
+        for i in 0..200 {
+            let angle = TAU * f64::from(i) / 20.0;
+            counter.feed((angle.cos() * 4000.0) as i16, (angle.sin() * 4000.0) as i16);
+        }
+        assert_eq!(counter.turns(), (0.0, 0.0));
+    }
+
+    fn push(direction: Direction, positions: &[(i16, i16)]) -> PushCheck {
+        let mut check = PushCheck::new(direction);
+        for &(x, y) in positions {
+            check.feed(x, y);
+        }
+        check
+    }
+
+    #[test]
+    fn a_clean_push_passes() {
+        let check = push(Direction::Up, &[(0, 12000), (0, 32767), (0, 9000), (3, 12)]);
+        assert!(check.released());
+        assert_eq!(check.outcome(), Outcome::Pass);
+        // The same for each direction.
+        for (direction, edge) in [
+            (Direction::Right, (32767, 0)),
+            (Direction::Down, (0, -32768)),
+            (Direction::Left, (-32768, 0)),
+        ] {
+            let check = push(direction, &[edge, (0, 0)]);
+            assert_eq!(check.outcome(), Outcome::Pass, "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn a_push_that_stops_short_fails() {
+        let check = push(Direction::Right, &[(15000, 0), (22000, 100), (0, 0)]);
+        assert_eq!(check.outcome(), Outcome::ShortOfEdge);
+    }
+
+    #[test]
+    fn a_stick_that_does_not_come_back_fails() {
+        // Stuck well away from the centre: not judged until it times out.
+        let check = push(Direction::Down, &[(0, -32768), (900, -13000)]);
+        assert!(!check.released());
+        assert_eq!(check.outcome(), Outcome::OffCentre);
+        // Rests a little off the centre: judged, and not good enough.
+        let check = push(Direction::Down, &[(0, -32768), (0, -2500)]);
+        assert!(check.released());
+        assert_eq!(check.outcome(), Outcome::OffCentre);
+        // A small residual offset is fine.
+        let check = push(Direction::Down, &[(0, -32768), (6, -1200)]);
+        assert_eq!(check.outcome(), Outcome::Pass);
+    }
+
+    #[test]
+    fn a_push_in_another_direction_does_not_count() {
+        let check = push(Direction::Up, &[(0, -32768), (0, 0)]);
+        assert!(!check.started);
+        assert_eq!(check.outcome(), Outcome::NoMovement);
+    }
+
+    #[test]
+    fn limits_are_described_for_people() {
+        let limits = Limits {
+            horizontal_min: 900,
+            horizontal_max: 3150,
+            vertical_min: 910,
+            vertical_max: 3270,
+        };
+        assert_eq!(
+            describe_limits(Some(limits)),
+            "horizontal 900-3150, vertical 910-3270"
+        );
+        let empty = Limits {
+            horizontal_min: 0,
+            horizontal_max: 0,
+            vertical_min: 0,
+            vertical_max: 0,
+        };
+        assert!(describe_limits(Some(empty)).starts_with("no calibration"));
+        assert!(describe_limits(None).starts_with("no calibration"));
+    }
+}

@@ -138,6 +138,44 @@ A restart looks like this on the wire:
 5. The update continues with GetVersion; a component completed before the
    restart now reports its new version.
 
+## Stick calibration
+
+Command `0x1e` with flags `10` (the sender asks for an ACK) starts and reads the
+stick calibration. It is what the Xbox Accessories app uses (`StartCalibration`
+and `GetCalibration`); the layout was observed on a Series X|S controller,
+firmware 5.23.6.0. The masks select the stick: bit 0 left, bit 1 right.
+
+- **Read**: payload `0f <mask>`. The reply is `0f 00 <status>` followed by one
+  block per selected stick: `<mask> <h_min> <h_max> <v_min> <v_max>`, four u16.
+  The values are raw readings of about 12 bits (centre near `0x800`). Zero
+  limits mean that no calibration is stored, and the controller then uses
+  built-in defaults.
+- **Start**: payload `10 <mask>`, reply `10 00 <mask>`. The controller erases the
+  stored limits of those sticks right away.
+- **Status** of a read: `00` idle, bit 0 or bit 1 while that stick is being
+  calibrated, `10` for about half a second while the result is saved.
+- **Finishing**: there is no commit message. The controller finishes by itself
+  once the stick has been turned through its range; it did so after about 6
+  clockwise and 5 counter-clockwise turns (the Xbox Accessories app asks for 6
+  each, then pushes to up, right, down and left, which the controller did not
+  need). The status goes to `10` and then `00`, with the learned limits stored
+  in non-volatile memory. They were still there after a power cycle.
+- **Interruption**: the erased limits stay erased if the calibration is not
+  finished. A Start while another one is still pending did not finish; a reset
+  (Set Device State `07`) clears the pending state.
+- The controller also sends a one-byte message with command `0x77` while it
+  calibrates; `xboxctl` only acknowledges it.
+- Older firmware does not answer a read at all: a Series X|S on 5.13.3146.0
+  ignored it, with no ACK either. The Xbox Accessories app is reported to offer
+  calibration only from 5.19.3221.0; versions in between were not tried.
+  The stored limits were unchanged after updating down to 5.13.3146.0 and back
+  to 5.23.6.0, so they are kept outside the firmware image.
+
+The controller sends input reports (command `0x20`: buttons u16, two triggers
+u16, then left X, left Y, right X, right Y as i16, Y up) only when something
+changes, so a stick at rest is silent. `xboxctl calibrate` follows the rotations
+and the final check with them.
+
 ## Series X|S controller (`045e:0b12`, MERL) layout
 
 | id | flash address | partition | contents |
