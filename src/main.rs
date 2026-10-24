@@ -103,17 +103,21 @@ enum Command {
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(1..=100))]
         strength: u8,
     },
-    /// Recalibrate the controller's thumbsticks with a guided walkthrough, and
-    /// check them afterwards. The controller forgets its current stick
-    /// calibration as soon as you start, so finish all the steps.
+    /// Recalibrate the controller's thumbsticks or triggers with a guided
+    /// walkthrough, and check them afterwards. The controller forgets its
+    /// current calibration as soon as you start, so finish all the steps.
     Calibrate {
         /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
         #[arg(long)]
         device: Option<String>,
-        /// Which stick to calibrate; both are done one after the other.
-        #[arg(long, value_enum, default_value_t = calibrate::StickChoice::Both)]
-        stick: calibrate::StickChoice,
-        /// Show the sticks' current calibration without changing anything.
+        /// Which stick to calibrate; both are done one after the other. The
+        /// sticks are the default when neither this nor --trigger is given.
+        #[arg(long, value_enum)]
+        stick: Option<calibrate::Side>,
+        /// Which trigger to calibrate; both are done one after the other.
+        #[arg(long, value_enum)]
+        trigger: Option<calibrate::Side>,
+        /// Show the current calibration without changing anything.
         #[arg(long)]
         dry_run: bool,
         /// Skip the confirmation prompt.
@@ -194,12 +198,18 @@ fn main() {
         Command::Calibrate {
             device,
             stick,
+            trigger,
             dry_run,
             yes,
         } => {
-            if let Err(error) =
-                calibrate::run(device.as_deref(), stick, dry_run, yes, trace_packets)
-            {
+            if let Err(error) = calibrate::run(
+                device.as_deref(),
+                stick,
+                trigger,
+                dry_run,
+                yes,
+                trace_packets,
+            ) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
