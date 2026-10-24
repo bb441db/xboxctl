@@ -1,9 +1,11 @@
 mod calibrate;
+mod diag;
 mod feed;
 mod gip;
 mod holders;
 #[cfg(target_os = "macos")]
 mod iokit;
+mod live;
 #[cfg(unix)]
 mod sys;
 mod usb;
@@ -124,6 +126,18 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Show what the controller reports about itself (identity, firmware),
+    /// then a live view of its buttons, sticks and triggers that
+    /// also watches for stick drift. Changes nothing on the controller.
+    Diag {
+        /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Stop the live view after this many seconds (default: until you
+        /// hold the Xbox button for two seconds, or press Ctrl-C).
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+        duration: Option<u64>,
+    },
     /// Debugging aids (debug builds only).
     #[cfg(debug_assertions)]
     Test {
@@ -208,6 +222,16 @@ fn main() {
                 trigger,
                 dry_run,
                 yes,
+                trace_packets,
+            ) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Command::Diag { device, duration } => {
+            if let Err(error) = diag::run(
+                device.as_deref(),
+                duration.map(Duration::from_secs),
                 trace_packets,
             ) {
                 eprintln!("{error}");
@@ -454,8 +478,13 @@ fn info(device: Option<&str>, trace: bool) -> Result<(), String> {
     let controller = usb::select_controller(device)?;
     println!("{}", describe(&controller));
     let mut link = UsbLink::open(&controller, trace)?;
+    print_info(&controller, &mut link)
+}
 
-    if let Some(hello) = start_device(&mut link)? {
+/// Start the controller and print what it says about itself: the Hello and
+/// the firmware components.
+fn print_info(controller: &Controller, link: &mut UsbLink) -> Result<(), String> {
+    if let Some(hello) = start_device(link)? {
         println!(
             "Device ID      {}",
             usb::hex(&hello.device_id).replace(' ', "")
@@ -471,13 +500,13 @@ fn info(device: Option<&str>, trace: bool) -> Result<(), String> {
         ..Options::default()
     };
     let mut ignore = |_: &Event| {};
-    let mut ufu = Updater::new(&mut link, options, &mut ignore);
+    let mut ufu = Updater::new(link, options, &mut ignore);
     let ufu_info = match ufu.query_info() {
         Ok(ufu_info) => ufu_info,
         Err(error) => {
             println!(
                 "Update protocol: not available ({error}){}",
-                no_response_hint(&controller, &error)
+                no_response_hint(controller, &error)
             );
             return Ok(());
         }

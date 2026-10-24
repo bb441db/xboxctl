@@ -13,13 +13,14 @@ use crate::{
         frame::{self, Packet, Sequence},
         updater::Link,
     },
+    live::Live,
     start_device,
     usb::{self, UsbLink},
 };
 use clap::ValueEnum;
 use std::{
     f64::consts::{PI, TAU},
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, BufRead, Write},
     time::{Duration, Instant},
 };
 
@@ -353,50 +354,6 @@ impl TriggerCheck {
 
     fn reaches_end(&self) -> bool {
         self.peak >= Self::REACH
-    }
-}
-
-/// One line that is rewritten in place on a terminal, like the update
-/// progress.
-struct Live {
-    terminal: bool,
-    width: Option<usize>,
-    last: String,
-}
-
-impl Live {
-    fn new() -> Self {
-        Self {
-            terminal: io::stdout().is_terminal(),
-            width: None,
-            last: String::new(),
-        }
-    }
-
-    fn show(&mut self, text: &str) {
-        if text == self.last {
-            return;
-        }
-        self.last = text.to_owned();
-        if self.terminal {
-            let width = self.width.unwrap_or(0);
-            print!("\r{text:<width$}");
-            io::stdout().flush().ok();
-            self.width = Some(text.chars().count());
-        } else {
-            println!("{text}");
-        }
-    }
-
-    /// Replace the line with its final text and move on.
-    fn done(&mut self, text: &str) {
-        if self.terminal {
-            let width = self.width.take().unwrap_or(0);
-            println!("\r{text:<width$}");
-        } else if text != self.last {
-            println!("{text}");
-        }
-        self.last.clear();
     }
 }
 
