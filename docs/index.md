@@ -87,6 +87,8 @@ xboxctl update --latest --dry-run  # compare the controller with the current fir
 xboxctl update --latest            # install the current firmware
 xboxctl update <package.bin>       # install an rdhm package file
 xboxctl rumble                     # run each rumble motor briefly (--strength 1-100)
+xboxctl calibrate                  # guided thumbstick calibration (--stick left|right|both)
+xboxctl calibrate --dry-run        # show the stored stick calibration, change nothing
 ```
 
 With several controllers connected, choose one with `--device BUS:ADDRESS`
@@ -115,6 +117,29 @@ Wired rumble does not work through macOS itself for Xbox One, Series X|S and
 Elite Series 2 controllers (checked on macOS 15.7 and reported on 27.0.1), so
 this is the way to check the hardware there. See
 [the notes on the macOS driver]({% link macos-driver.md %}).
+
+## Calibrating the sticks
+
+`xboxctl calibrate` walks you through recalibrating the thumbsticks, like the
+Xbox Accessories app does. For each stick it asks you to turn it clockwise 6
+times and then counter-clockwise 6 times at the outer edge, with a counter that
+follows your progress, and it finishes with a check: push the stick up, right,
+down and left and let go, and `xboxctl` confirms that it reached the edge and
+came back to the centre. Without `--stick` it does the left stick and then the
+right one.
+
+The controller learns the stick's range itself and stores it, so the result
+stays after you unplug the controller. It also erases a stick's stored
+calibration the moment the calibration starts: finish all the steps, and if you
+stop halfway run the command again (the controller falls back to its default
+calibration meanwhile). `xboxctl calibrate --dry-run` only shows the stored
+range of each stick.
+
+Checked on an Xbox Series X|S controller (firmware 5.23). Firmware that does not
+support calibration does not answer (a Series X|S on 5.13.3146.0 did not), and
+`xboxctl` says so; `xboxctl update --latest` brings the controller up to date.
+A firmware update leaves the stored calibration alone: it was unchanged after
+going from 5.23 down to 5.13.3146.0 and back.
 
 ## Permissions
 

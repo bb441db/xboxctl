@@ -73,6 +73,8 @@ xboxctl update --latest --dry-run  # compare the controller with the current fir
 xboxctl update --latest            # install the current firmware
 xboxctl update <package.bin>       # install an rdhm package file
 xboxctl rumble                     # run each rumble motor briefly (--strength 1-100)
+xboxctl calibrate                  # guided thumbstick calibration (--stick left|right|both)
+xboxctl calibrate --dry-run        # show the stored stick calibration, change nothing
 ```
 
 With several controllers connected, choose one with `--device BUS:ADDRESS`
@@ -101,6 +103,29 @@ reported on 27.0.1). If `xboxctl rumble` moves
 the motors, the controller is fine and the problem is macOS. The bug has been
 reported to Apple as FB25254769; see
 [the notes on the macOS driver](https://bb441db.github.io/xboxctl/macos-driver).
+
+### Calibrating the sticks
+
+`xboxctl calibrate` walks you through recalibrating the thumbsticks, like the
+Xbox Accessories app does. For each stick it asks you to turn it clockwise 6
+times and then counter-clockwise 6 times at the outer edge, with a counter that
+follows your progress, and it finishes with a check: push the stick up, right,
+down and left and let go, and `xboxctl` confirms that it reached the edge and
+came back to the centre. Without `--stick` it does the left stick and then the
+right one.
+
+The controller learns the stick's range itself and stores it, so the result
+stays after you unplug the controller. It also erases a stick's stored
+calibration the moment the calibration starts: finish all the steps, and if you
+stop halfway run the command again (the controller falls back to its default
+calibration meanwhile). `xboxctl calibrate --dry-run` only shows the stored
+range of each stick.
+
+Checked on an Xbox Series X|S controller (firmware 5.23). Firmware that does not
+support calibration does not answer (a Series X|S on 5.13.3146.0 did not), and
+`xboxctl` says so; `xboxctl update --latest` brings the controller up to date.
+A firmware update leaves the stored calibration alone: it was unchanged after
+going from 5.23 down to 5.13.3146.0 and back.
 
 ## Permissions
 
@@ -271,6 +296,44 @@ A restart looks like this on the wire:
    (60 s after component 7, which only the Adaptive Controller has).
 5. The update continues with GetVersion; a component completed before the
    restart now reports its new version.
+
+### Stick calibration
+
+Command `0x1e` with flags `10` (the sender asks for an ACK) starts and reads the
+stick calibration. It is what the Xbox Accessories app uses (`StartCalibration`
+and `GetCalibration`); the layout was observed on a Series X|S controller,
+firmware 5.23.6.0. The masks select the stick: bit 0 left, bit 1 right.
+
+- **Read**: payload `0f <mask>`. The reply is `0f 00 <status>` followed by one
+  block per selected stick: `<mask> <h_min> <h_max> <v_min> <v_max>`, four u16.
+  The values are raw readings of about 12 bits (centre near `0x800`). Zero
+  limits mean that no calibration is stored, and the controller then uses
+  built-in defaults.
+- **Start**: payload `10 <mask>`, reply `10 00 <mask>`. The controller erases the
+  stored limits of those sticks right away.
+- **Status** of a read: `00` idle, bit 0 or bit 1 while that stick is being
+  calibrated, `10` for about half a second while the result is saved.
+- **Finishing**: there is no commit message. The controller finishes by itself
+  once the stick has been turned through its range; it did so after about 6
+  clockwise and 5 counter-clockwise turns (the Xbox Accessories app asks for 6
+  each, then pushes to up, right, down and left, which the controller did not
+  need). The status goes to `10` and then `00`, with the learned limits stored
+  in non-volatile memory. They were still there after a power cycle.
+- **Interruption**: the erased limits stay erased if the calibration is not
+  finished. A Start while another one is still pending did not finish; a reset
+  (Set Device State `07`) clears the pending state.
+- The controller also sends a one-byte message with command `0x77` while it
+  calibrates; `xboxctl` only acknowledges it.
+- Older firmware does not answer a read at all: a Series X|S on 5.13.3146.0
+  ignored it, with no ACK either. The Xbox Accessories app is reported to offer
+  calibration only from 5.19.3221.0; versions in between were not tried.
+  The stored limits were unchanged after updating down to 5.13.3146.0 and back
+  to 5.23.6.0, so they are kept outside the firmware image.
+
+The controller sends input reports (command `0x20`: buttons u16, two triggers
+u16, then left X, left Y, right X, right Y as i16, Y up) only when something
+changes, so a stick at rest is silent. `xboxctl calibrate` follows the rotations
+and the final check with them.
 
 ### Series X|S controller (`045e:0b12`, MERL) layout
 
