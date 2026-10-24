@@ -26,11 +26,28 @@ const JITTER: f64 = 0.03;
 const STEADY: Duration = Duration::from_secs(3);
 /// A stick that rests this far from the centre, or further, is drifting.
 const DRIFT_MIN: f64 = 0.06;
-/// Further than this, the stick is probably held on purpose.
+/// A little off-centre is normal wear; from here it is worth mentioning.
+const MILD: f64 = 0.03;
+/// Still this far out, the stick is either held or badly stuck: a hand and a
+/// stick that drifts look the same until the hand lets go.
 const DRIFT_MAX: f64 = 0.30;
+
+/// USB product id of the Xbox Series X|S controller, the one with a share button.
+const SERIES_XS: u16 = 0x0b12;
+/// USB product id of the Xbox One S controller, which refuses calibration.
+const ONE_S: u16 = 0x02ea;
 
 /// Travel from which a stick or trigger counts as used, for the summary.
 const MOVED: f64 = 0.15;
+
+/// What a stick that stopped moving turned out to be doing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Finding {
+    /// It rests a little off-centre: drift.
+    Drift((f64, f64)),
+    /// It stays far from the centre: held, or stuck there.
+    Held((f64, f64)),
+}
 
 /// Judges whether a stick that is not moving rests at the centre.
 ///
@@ -42,16 +59,18 @@ struct RestWatch {
     since: Duration,
     /// Held still for long enough to judge at least once.
     judged: bool,
-    /// Where it was last judged to rest, and whether that looked like drift.
+    /// Where it was last judged, by what it turned out to be: at rest near
+    /// the centre, drifting, or far out.
     rested_at: Option<(f64, f64)>,
     drift: Option<(f64, f64)>,
+    held: Option<(f64, f64)>,
     reported: bool,
 }
 
 impl RestWatch {
-    /// Feed the stick position (-1 to 1 on each axis) at `now`. Returns the
-    /// resting position when the stick is first judged to be drifting.
-    fn update(&mut self, now: Duration, x: f64, y: f64) -> Option<(f64, f64)> {
+    /// Feed the stick position (-1 to 1 on each axis) at `now`. Returns what
+    /// the stick is first judged to be doing when that is not rest.
+    fn update(&mut self, now: Duration, x: f64, y: f64) -> Option<Finding> {
         if (x - self.anchor.0).abs() > JITTER || (y - self.anchor.1).abs() > JITTER {
             self.anchor = (x, y);
             self.since = now;
@@ -62,19 +81,23 @@ impl RestWatch {
             return None;
         }
         self.judged = true;
-        let (x, y) = self.anchor;
-        let offset = x.hypot(y);
-        if (DRIFT_MIN..=DRIFT_MAX).contains(&offset) {
-            self.drift = Some((x, y));
-            if !self.reported {
-                self.reported = true;
-                return Some((x, y));
-            }
-        } else if offset < DRIFT_MIN {
-            self.rested_at = Some((x, y));
-            self.drift = None;
+        let at = self.anchor;
+        let offset = at.0.hypot(at.1);
+        let finding = if offset > DRIFT_MAX {
+            (self.rested_at, self.drift, self.held) = (None, None, Some(at));
+            Finding::Held(at)
+        } else if offset >= DRIFT_MIN {
+            (self.rested_at, self.drift, self.held) = (None, Some(at), None);
+            Finding::Drift(at)
+        } else {
+            (self.rested_at, self.drift, self.held) = (Some(at), None, None);
+            return None;
+        };
+        if self.reported {
+            return None;
         }
-        None
+        self.reported = true;
+        Some(finding)
     }
 }
 
@@ -105,12 +128,34 @@ struct View {
     left_rest: RestWatch,
     right_rest: RestWatch,
     exit_since: Option<Duration>,
+    /// The controller has no share button (only the Series X|S does), so it
+    /// is not expected in the summary.
+    no_share: bool,
+    /// The controller cannot be calibrated, so it is not suggested.
+    no_calibration: bool,
     /// At least one input report has arrived. Until then the positions are
     /// not known, only assumed to be at rest.
     fed: bool,
 }
 
+/// "; `xboxctl calibrate --stick left` may help", for a controller that can.
+fn calibrate_hint(possible: bool, side: &str) -> String {
+    if possible {
+        format!("; `xboxctl calibrate --stick {side}` may help")
+    } else {
+        String::new()
+    }
+}
+
 impl View {
+    fn new(product_id: u16) -> Self {
+        Self {
+            no_share: product_id != SERIES_XS,
+            no_calibration: product_id == ONE_S,
+            ..Self::default()
+        }
+    }
+
     fn feed(&mut self, report: InputReport) {
         self.fed = true;
         self.report = report;
@@ -149,19 +194,27 @@ impl View {
             return notes;
         }
         let r = self.report;
+        let can_calibrate = !self.no_calibration;
         for (name, watch, (x, y)) in [
             ("Left", &mut self.left_rest, r.left),
             ("Right", &mut self.right_rest, r.right),
         ] {
-            if let Some((x, y)) = watch.update(now, normalised(x), normalised(y)) {
-                notes.push(format!(
-                    "  ! The {} stick rests off-centre (x {:+}%, y {:+}%). That can be stick \
-                     drift; `xboxctl calibrate --stick {}` may help.",
-                    name.to_lowercase(),
+            let lower = name.to_lowercase();
+            match watch.update(now, normalised(x), normalised(y)) {
+                Some(Finding::Drift((x, y))) => notes.push(format!(
+                    "  ! The {lower} stick rests off-centre (x {:+}%, y {:+}%). That can be stick \
+                     drift{}.",
                     percent(x),
                     percent(y),
-                    name.to_lowercase()
-                ));
+                    calibrate_hint(can_calibrate, &lower),
+                )),
+                Some(Finding::Held((x, y))) => notes.push(format!(
+                    "  ? The {lower} stick has stayed at x {:+}%, y {:+}% for a few seconds. Let \
+                     go of it: if it does not come back to the centre, it is drifting badly.",
+                    percent(x),
+                    percent(y),
+                )),
+                None => {}
             }
         }
         match (self.guide, self.exit_since) {
@@ -209,12 +262,12 @@ impl View {
         };
         let mut lines = Vec::new();
 
-        let all = BUTTONS.len() + 2;
+        let all = BUTTONS.len() + 1 + usize::from(!self.no_share);
         let missing: Vec<&str> = BUTTONS
             .iter()
             .filter(|(bit, _)| self.buttons_seen & bit == 0)
             .map(|&(_, name)| name)
-            .chain((!self.share_seen).then_some(SHARE))
+            .chain((!self.share_seen && !self.no_share).then_some(SHARE))
             .chain((!self.guide_seen).then_some(GUIDE))
             .collect();
         lines.push(if missing.is_empty() {
@@ -243,13 +296,25 @@ impl View {
                 .to_owned()
         };
         let position = |(x, y): (f64, f64)| format!("{:+}%, {:+}%", percent(x), percent(y));
-        let drift = |watch: &RestWatch| match (watch.drift, watch.rested_at, watch.judged) {
+        let drift = |watch: &RestWatch| match (watch.drift, watch.held, watch.rested_at) {
             (Some(at), _, _) => format!("possible drift ({})", position(at)),
-            (None, Some(_), _) => "none seen".to_owned(),
-            (None, None, true) => "held off-centre, not judged".to_owned(),
-            (None, None, false) => "not judged (not left alone)".to_owned(),
+            (_, Some(at), _) => format!("stayed at {} (drift, unless held)", position(at)),
+            (_, _, Some(at)) if at.0.hypot(at.1) >= MILD => {
+                format!("slightly off-centre ({})", position(at))
+            }
+            (_, _, Some(_)) => "none seen".to_owned(),
+            _ => "not judged (not left alone)".to_owned(),
         };
-        let stick = |(x, y): (i16, i16)| position((normalised(x), normalised(y)));
+        // A stick that was already pushed over in the first report is held or
+        // stuck, so that report says nothing about where it rests.
+        let stick = |(x, y): (i16, i16)| {
+            let at = (normalised(x), normalised(y));
+            if at.0.hypot(at.1) > DRIFT_MAX {
+                "far out".to_owned()
+            } else {
+                position(at)
+            }
+        };
 
         lines.push(row("Control", "At rest", "Reach", "Drift"));
         lines.push(row(
@@ -278,10 +343,16 @@ impl View {
         ));
         lines.push(String::new());
 
-        let drifting: Vec<&str> = [("left", &self.left_rest), ("right", &self.right_rest)]
-            .into_iter()
+        let sticks = [("left", &self.left_rest), ("right", &self.right_rest)];
+        let drifting: Vec<&str> = sticks
+            .iter()
             .filter(|(_, watch)| watch.drift.is_some())
-            .map(|(name, _)| name)
+            .map(|&(name, _)| name)
+            .collect();
+        let stuck: Vec<&str> = sticks
+            .iter()
+            .filter(|(_, watch)| watch.held.is_some())
+            .map(|&(name, _)| name)
             .collect();
         let untested = !missing.is_empty()
             || self.left_reach < MOVED
@@ -290,9 +361,15 @@ impl View {
             || trigger(self.right_trigger_peak) < MOVED;
         lines.push(if let Some(name) = drifting.first() {
             format!(
-                "Result         possible drift on the {} stick; `xboxctl calibrate --stick {name}` \
-                 may help",
-                drifting.join(" and ")
+                "Result         possible drift on the {} stick{}",
+                drifting.join(" and "),
+                calibrate_hint(!self.no_calibration, name)
+            )
+        } else if !stuck.is_empty() {
+            format!(
+                "Result         the {} stick stayed far from the centre: if you were not holding \
+                 it, it is drifting badly; run again without touching it",
+                stuck.join(" and ")
             )
         } else if untested {
             "Result         nothing wrong seen, but not everything was used".to_owned()
@@ -327,7 +404,7 @@ pub fn run(device: Option<&str>, duration: Option<Duration>, trace: bool) -> Res
     let mut link = UsbLink::open(&controller, trace)?;
     print_info(&controller, &mut link)?;
 
-    let mut view = View::default();
+    let mut view = View::new(controller.product_id);
 
     println!("\nLive view");
     println!("  - Press any button to start. The controller only reports changes, so this");
@@ -387,7 +464,10 @@ mod tests {
         assert_eq!(watch.update(secs(0), 0.0, 0.0), None);
         assert_eq!(watch.update(secs(1), 0.1, -0.02), None);
         assert_eq!(watch.update(secs(3), 0.1, -0.02), None);
-        assert_eq!(watch.update(secs(4), 0.1, -0.02), Some((0.1, -0.02)));
+        assert_eq!(
+            watch.update(secs(4), 0.1, -0.02),
+            Some(Finding::Drift((0.1, -0.02)))
+        );
         assert_eq!(watch.update(secs(9), 0.1, -0.02), None);
         assert_eq!(watch.drift, Some((0.1, -0.02)));
     }
@@ -403,13 +483,24 @@ mod tests {
     }
 
     #[test]
-    fn a_stick_held_far_out_is_not_drift() {
+    fn a_stick_that_stays_far_out_is_held_or_stuck() {
         let mut watch = RestWatch::default();
         watch.update(secs(0), 0.8, 0.0);
-        assert_eq!(watch.update(secs(5), 0.8, 0.0), None);
+        assert_eq!(
+            watch.update(secs(5), 0.8, 0.0),
+            Some(Finding::Held((0.8, 0.0)))
+        );
+        // Said once, and it is not called drift or rest.
+        assert_eq!(watch.update(secs(9), 0.8, 0.0), None);
         assert!(watch.judged);
         assert_eq!(watch.drift, None);
         assert_eq!(watch.rested_at, None);
+        assert_eq!(watch.held, Some((0.8, 0.0)));
+        // Letting go and coming back to the centre clears it.
+        watch.update(secs(10), 0.0, 0.0);
+        assert_eq!(watch.update(secs(14), 0.0, 0.0), None);
+        assert_eq!(watch.held, None);
+        assert_eq!(watch.rested_at, Some((0.0, 0.0)));
     }
 
     #[test]
@@ -418,7 +509,10 @@ mod tests {
         watch.update(secs(0), 0.1, 0.0);
         assert_eq!(watch.update(secs(2), 0.2, 0.0), None);
         assert_eq!(watch.update(secs(4), 0.2, 0.0), None);
-        assert_eq!(watch.update(secs(5), 0.2, 0.0), Some((0.2, 0.0)));
+        assert_eq!(
+            watch.update(secs(5), 0.2, 0.0),
+            Some(Finding::Drift((0.2, 0.0)))
+        );
     }
 
     #[test]
@@ -426,7 +520,10 @@ mod tests {
         let mut watch = RestWatch::default();
         watch.update(secs(0), 0.1, 0.0);
         assert_eq!(watch.update(secs(2), 0.11, 0.01), None);
-        assert_eq!(watch.update(secs(3), 0.09, -0.01), Some((0.1, 0.0)));
+        assert_eq!(
+            watch.update(secs(3), 0.09, -0.01),
+            Some(Finding::Drift((0.1, 0.0)))
+        );
     }
 
     fn report(buttons: u16) -> InputReport {
@@ -512,6 +609,32 @@ mod tests {
     }
 
     #[test]
+    fn other_controllers_have_no_share_button() {
+        let mut view = View::new(0x02ea);
+        view.feed(report(1 << 4));
+        let summary = view.summary();
+        assert!(summary[0].starts_with("Buttons        1 of 15 pressed"));
+        assert!(!summary[0].contains("Share"));
+        let mut series = View::new(SERIES_XS);
+        series.feed(report(1 << 4));
+        assert!(series.summary()[0].contains("1 of 16 pressed"));
+        assert!(series.summary()[0].contains("Share"));
+    }
+
+    #[test]
+    fn a_stick_far_out_in_the_first_report_is_not_a_resting_position() {
+        let mut view = View::default();
+        view.feed(InputReport {
+            left: (1966, 32767),
+            right: (-100, 50),
+            ..InputReport::default()
+        });
+        let summary = view.summary();
+        assert!(summary[3].starts_with("Left stick     far out"));
+        assert!(summary[4].starts_with("Right stick    +0%, +0%"));
+    }
+
+    #[test]
     fn the_xbox_button_is_shown_and_counted() {
         let mut view = View::default();
         view.feed(report(1 << 4));
@@ -521,6 +644,55 @@ mod tests {
         assert!(!view.line().contains("Guide"));
         assert!(view.summary()[0].contains("2 of 16 pressed"));
         assert!(!view.summary()[0].contains("Guide)"));
+    }
+
+    #[test]
+    fn a_stick_that_stays_far_out_is_reported_without_calling_it_held() {
+        let mut view = View::default();
+        view.feed(InputReport {
+            left: (1966, 32767),
+            ..InputReport::default()
+        });
+        view.tick(secs(1));
+        let notes = view.tick(secs(5));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("Let go of it"));
+        assert!(notes[0].contains("drifting badly"));
+        let summary = view.summary();
+        assert!(summary[3].contains("stayed at +6%, +100% (drift, unless held)"));
+        assert!(summary.last().unwrap().contains("drifting badly"));
+    }
+
+    #[test]
+    fn calibration_is_only_suggested_where_it_exists() {
+        let drifting = InputReport {
+            left: (3277, 0),
+            ..InputReport::default()
+        };
+        for (product_id, suggested) in [(SERIES_XS, true), (ONE_S, false)] {
+            let mut view = View::new(product_id);
+            view.feed(drifting);
+            view.tick(secs(1));
+            let note = view.tick(secs(5)).remove(0);
+            assert_eq!(note.contains("calibrate"), suggested, "{note}");
+            let result = view.summary().pop().unwrap();
+            assert!(result.contains("possible drift on the left stick"));
+            assert_eq!(result.contains("calibrate"), suggested, "{result}");
+        }
+    }
+
+    #[test]
+    fn a_stick_a_little_off_centre_is_noted_in_the_table() {
+        let mut view = View::default();
+        view.feed(InputReport {
+            right: (1311, -983),
+            ..InputReport::default()
+        });
+        view.tick(secs(1));
+        view.tick(secs(5));
+        let summary = view.summary();
+        assert!(summary[4].ends_with("slightly off-centre (+4%, -3%)"));
+        assert!(!summary.last().unwrap().contains("drift"));
     }
 
     #[test]

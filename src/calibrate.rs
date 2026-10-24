@@ -44,6 +44,7 @@ const PUSH_LIMIT: Duration = Duration::from_secs(10);
 const SETTLE: Duration = Duration::from_millis(300);
 
 const NO_REPLY: &str = "no reply to the calibration request";
+const REJECTED: &str = "the controller refused the calibration request";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Side {
@@ -393,6 +394,7 @@ impl Session {
                 };
                 self.ack(&packet)?;
                 match Response::parse(&packet) {
+                    Some(Response::Rejected { .. }) => return Err(REJECTED.to_owned()),
                     Some(response) if wanted(&response) => return Ok(response),
                     _ => other(&packet),
                 }
@@ -471,7 +473,7 @@ impl Session {
 fn status(response: &Response) -> u8 {
     match response {
         Response::Read { status, .. } => *status,
-        Response::Recenter { .. } => 0,
+        Response::Recenter { .. } | Response::Rejected { .. } => 0,
     }
 }
 
@@ -541,15 +543,13 @@ pub fn run(
     }
 
     // The controller only answers on firmware that supports calibration.
-    let unsupported = |error: String| {
-        if error == NO_REPLY {
-            "This controller did not answer the calibration request, so it probably does \
-                 not support calibration. Newer firmware might: see `xboxctl update --latest \
-                 --dry-run`."
-                .to_owned()
-        } else {
-            error
-        }
+    let unsupported = |error: String| match error.as_str() {
+        NO_REPLY => "This controller did not answer the calibration request, so it probably \
+                 does not support calibration. Newer firmware might: see `xboxctl update \
+                 --latest --dry-run`."
+            .to_owned(),
+        REJECTED => "This controller answered that it does not support calibration.".to_owned(),
+        _ => error,
     };
     let current = session.read(groups[0], &mut |_| {}).map_err(unsupported)?;
 

@@ -164,6 +164,10 @@ pub enum Response {
     /// sent. It only starts the calibration: the limits read as zero until the
     /// stick has been rotated through its range (see `Read`).
     Recenter { status: u8, mask: u8 },
+    /// Reply of two bytes, `<sub-command> <code>`: the controller understood
+    /// the request and refused it. An Xbox One S controller on firmware 5.22
+    /// answered every read with `0f 01`.
+    Rejected { sub_command: u8, code: u8 },
 }
 
 impl Response {
@@ -172,6 +176,11 @@ impl Response {
             return None;
         }
         let payload = packet.payload.as_slice();
+        if let &[sub_command @ (READ | RECENTER), code] = payload
+            && code != 0
+        {
+            return Some(Self::Rejected { sub_command, code });
+        }
         match *payload.first()? {
             READ => {
                 let status = *payload.get(2)?;
@@ -383,6 +392,21 @@ mod tests {
         assert_eq!(left.unwrap().vertical_max, 0x0c57);
         assert_eq!(right, None);
         assert_eq!(left_trigger.unwrap().min, 0x046d);
+    }
+
+    #[test]
+    fn parses_a_rejection() {
+        // An Xbox One S controller (CRET) on firmware 5.22.
+        assert_eq!(
+            Response::parse(&reply(&[0x0f, 0x01])),
+            Some(Response::Rejected {
+                sub_command: 0x0f,
+                code: 1
+            })
+        );
+        assert_eq!(Response::parse(&reply(&[0x42, 0x01])), None);
+        // A code of zero is not a refusal.
+        assert_eq!(Response::parse(&reply(&[0x0f, 0x00])), None);
     }
 
     #[test]
