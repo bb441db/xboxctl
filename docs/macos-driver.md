@@ -1,4 +1,5 @@
 ---
+permalink: /macos-driver/
 title: macOS wired driver
 nav_order: 4
 description: "Notes on Apple's built-in wired Xbox controller driver on macOS: what the DriverKit extension and HID service plugin do, and why wired rumble does not work."

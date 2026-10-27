@@ -60,7 +60,7 @@ On Linux, install the udev rule below so that `xboxctl` runs without root. On
 macOS, run it with `sudo`; see Permissions.
 
 Using a Steam Deck or another SteamOS device? See the
-[step by step guide for SteamOS](https://bb441db.github.io/xboxctl/steamos).
+[step by step guide for SteamOS](https://bb441db.github.io/xboxctl/steamos/).
 
 ## Usage
 
@@ -104,7 +104,7 @@ Xbox One, Series X|S and Elite Series 2 controllers (checked on macOS 15.7 and
 reported on 27.0.1). If `xboxctl rumble` moves
 the motors, the controller is fine and the problem is macOS. The bug has been
 reported to Apple as FB25254769; see
-[the notes on the macOS driver](https://bb441db.github.io/xboxctl/macos-driver).
+[the notes on the macOS driver](https://bb441db.github.io/xboxctl/macos-driver/).
 
 ### Diagnosing a controller
 
