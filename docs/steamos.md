@@ -1,4 +1,5 @@
 ---
+permalink: /steamos/
 title: Steam Deck and Steam Machine
 nav_order: 2
 description: "Update Xbox controller firmware on a Steam Deck, Steam Machine or any SteamOS device with xboxctl: a step by step guide, no Windows PC needed."
