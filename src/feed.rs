@@ -14,6 +14,13 @@ use std::{
 /// `https://aka.ms/xboxaccessoriesfwcdnxbga`.
 pub const FEED_URL: &str = "https://aka.ms/xboxaccessoriesfwcdnpcga";
 
+/// The flight feed the Xbox Accessories app's SDK uses for Pendragon
+/// accessories (the Nano Controller and relatives), found by reverse
+/// engineering `Devices.App.dll`; it is not in either public feed above and
+/// the app's own firmware check never requests it itself. See
+/// `docs/nano.md`.
+pub const NANO_FEED_URL: &str = "https://aka.ms/xboxaccessoriesfwcdn_ga_flt_u9uici32d8cemlcukq5k";
+
 #[derive(Debug, Deserialize)]
 pub struct Feed {
     /// Feed name, e.g. `pc_ga`.
@@ -68,6 +75,30 @@ impl Feed {
             .iter()
             .find(|device| device.id.eq_ignore_ascii_case(&id))
     }
+
+    /// The entry for a vendor ID and hardware revision, as the flight feed
+    /// identifies Pendragon accessories (`045E_0B4C-hw-0C06`): the SDK
+    /// matches these by the hardware revision a device reports, not by its
+    /// USB product ID, since one hardware revision can show up under more
+    /// than one product ID (the Nano's development and retail boards, for
+    /// instance).
+    pub fn device_by_hardware_revision(
+        &self,
+        vendor_id: u16,
+        hardware_revision: u16,
+    ) -> Option<&FeedDevice> {
+        let vendor = format!("{vendor_id:04X}");
+        let revision = format!("{hardware_revision:04X}");
+        self.devices.iter().find(|device| {
+            let Some((id_vendor_product, suffix)) = device.id.split_once("-hw-") else {
+                return false;
+            };
+            let Some((id_vendor, _id_product)) = id_vendor_product.split_once('_') else {
+                return false;
+            };
+            id_vendor.eq_ignore_ascii_case(&vendor) && suffix.eq_ignore_ascii_case(&revision)
+        })
+    }
 }
 
 impl FeedFile {
@@ -100,8 +131,8 @@ impl FeedFile {
     }
 }
 
-pub fn fetch_feed() -> Result<Feed, String> {
-    let json = ureq::get(FEED_URL)
+fn fetch(url: &str) -> Result<Feed, String> {
+    let json = ureq::get(url)
         .call()
         .map_err(|error| format!("could not fetch the firmware feed: {error}"))?
         .body_mut()
@@ -110,13 +141,21 @@ pub fn fetch_feed() -> Result<Feed, String> {
     Feed::parse(&json)
 }
 
+pub fn fetch_feed() -> Result<Feed, String> {
+    fetch(FEED_URL)
+}
+
+pub fn fetch_nano_feed() -> Result<Feed, String> {
+    fetch(NANO_FEED_URL)
+}
+
 /// Download `file` into `directory` unless a verified copy is already there.
-/// Returns the path and the parsed package.
-pub fn download(
+/// Returns the path and the raw, verified file contents.
+fn fetch_verified(
     feed: &Feed,
     file: &FeedFile,
     directory: &Path,
-) -> Result<(PathBuf, Package), String> {
+) -> Result<(PathBuf, Vec<u8>), String> {
     if file.name.contains(['/', '\\']) || file.name.starts_with('.') {
         return Err(format!("refusing unexpected file name {:?}", file.name));
     }
@@ -142,8 +181,31 @@ pub fn download(
             data
         }
     };
+    Ok((path, data))
+}
+
+/// Download `file` into `directory` unless a verified copy is already there.
+/// Returns the path and the parsed rdhm package.
+pub fn download(
+    feed: &Feed,
+    file: &FeedFile,
+    directory: &Path,
+) -> Result<(PathBuf, Package), String> {
+    let (path, data) = fetch_verified(feed, file, directory)?;
     let package = Package::parse(&data).map_err(|error| format!("{}: {error}", file.name))?;
     Ok((path, package))
+}
+
+/// Like [`download`], but for a Pendragon accessory's PPAS firmware image.
+pub fn download_image(
+    feed: &Feed,
+    file: &FeedFile,
+    directory: &Path,
+) -> Result<(PathBuf, crate::companion::firmware::Image), String> {
+    let (path, data) = fetch_verified(feed, file, directory)?;
+    let image = crate::companion::firmware::Image::parse(&data)
+        .map_err(|error| format!("{}: {error}", file.name))?;
+    Ok((path, image))
 }
 
 /// The user who ran `sudo xboxctl`, when that is what this process is:
@@ -235,6 +297,21 @@ mod tests {
             Some("jC-y7nRWRtQCHQCyi2rv6xtQpgikM6JG0r6lYE3A5pM=")
         );
         assert!(feed.device(0x045e, 0x0b17).is_none());
+    }
+
+    #[test]
+    fn matches_by_hardware_revision_not_product_id() {
+        let flight = r#"{"g":"ga_flt","v":"1.0.0.59",
+            "p":"https://example.invalid/accessories/M/",
+            "d":[{"__n":"tala_PV","id":"045E_0B4C-hw-0C06",
+                  "f":[{"__t":"ga","p":"TALA_045E_0B4C-hw-0C06_v_6_19_50_0_h_AAAA.bin"}]}]}"#;
+        let feed = Feed::parse(flight).unwrap();
+        // The retail Nano's USB product ID (0b4e) differs from the one in the
+        // feed's id (0b4c); only the vendor and hardware revision must match.
+        let device = feed.device_by_hardware_revision(0x045e, 0x0c06).unwrap();
+        assert_eq!(device.codename, "tala_PV");
+        assert!(feed.device_by_hardware_revision(0x045e, 0x0c01).is_none());
+        assert!(feed.device_by_hardware_revision(0x045f, 0x0c06).is_none());
     }
 
     #[test]

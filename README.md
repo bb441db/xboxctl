@@ -169,11 +169,18 @@ range of each trigger with the raw replies.
 On Linux, `xboxctl` detaches `xpad` from the controller while it runs and needs
 read/write access to the controller's USB device node. Install this udev rule
 once to run it without root. It gives the logged-in user access to GIP
-controllers (USB class `ff/47/d0`):
+controllers (USB class `ff/47/d0`) and to the Nano Controller / Pendragon
+family, which are plain HID devices matched by VID/PID instead:
 
 ```bash
-echo 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}=="ff", ATTR{bDeviceSubClass}=="47", ATTR{bDeviceProtocol}=="d0", TAG+="uaccess"' \
-  | sudo tee /etc/udev/rules.d/70-xboxctl.rules
+sudo tee /etc/udev/rules.d/70-xboxctl.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}=="ff", ATTR{bDeviceSubClass}=="47", ATTR{bDeviceProtocol}=="d0", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b1d", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b45", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b46", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b4c", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b4e", TAG+="uaccess"
+EOF
 sudo udevadm control --reload && sudo udevadm trigger
 ```
 
