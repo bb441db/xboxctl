@@ -1,4 +1,5 @@
 mod calibrate;
+mod companion;
 mod diag;
 mod feed;
 mod gip;
@@ -6,6 +7,8 @@ mod holders;
 #[cfg(target_os = "macos")]
 mod iokit;
 mod live;
+mod nano;
+mod progress;
 #[cfg(unix)]
 mod sys;
 mod usb;
@@ -18,7 +21,7 @@ use crate::gip::{
 use clap::{Parser, Subcommand};
 use std::{
     fs,
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, BufRead, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -51,15 +54,15 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List connected Xbox (GIP) controllers.
+    /// List connected Xbox controllers and accessories (GIP and Nano).
     List,
-    /// Show a controller's identity and firmware versions. Read-only.
+    /// Show a device's identity and firmware version. Read-only.
     Info {
-        /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
+        /// Device to use, as BUS:ADDRESS from `xboxctl list`.
         #[arg(long)]
         device: Option<String>,
     },
-    /// Download the current firmware for a controller from Microsoft's
+    /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
     Download {
         /// Controller to download for, as BUS:ADDRESS from `xboxctl list`.
@@ -75,16 +78,17 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
-    /// Update controller firmware from an rdhm package (the Xbox Accessories
-    /// app's MERL_*.bin files) or the current firmware from Microsoft's feed.
+    /// Update firmware: an rdhm package or Microsoft's feed for a GIP
+    /// controller, a PPAS image or the flight feed for a Nano.
     Update {
-        /// rdhm firmware package.
+        /// Firmware package (rdhm for a GIP controller, PPAS for a Nano).
         #[arg(required_unless_present = "latest")]
         image: Option<PathBuf>,
-        /// Download the current firmware from Microsoft's feed and install it.
+        /// Download the current firmware from Microsoft's feed and install
+        /// it. GIP controllers only.
         #[arg(long, conflicts_with = "image")]
         latest: bool,
-        /// Controller to update, as BUS:ADDRESS from `xboxctl list`.
+        /// Device to update, as BUS:ADDRESS from `xboxctl list`.
         #[arg(long)]
         device: Option<String>,
         /// Show the package and what would change, without writing anything.
@@ -183,7 +187,8 @@ fn main() {
             let result = if list {
                 list_feed()
             } else {
-                download(device.as_deref(), id.as_deref(), output).map(|_| ())
+                usb::reject_nano(device.as_deref(), "download")
+                    .and_then(|()| download(device.as_deref(), id.as_deref(), output).map(|_| ()))
             };
             if let Err(error) = result {
                 eprintln!("{error}");
@@ -204,7 +209,9 @@ fn main() {
             }
         }
         Command::Rumble { device, strength } => {
-            if let Err(error) = rumble(device.as_deref(), strength, trace_packets) {
+            let result = usb::reject_nano(device.as_deref(), "rumble")
+                .and_then(|()| rumble(device.as_deref(), strength, trace_packets));
+            if let Err(error) = result {
                 eprintln!("Rumble test failed: {error}");
                 std::process::exit(1);
             }
@@ -216,24 +223,30 @@ fn main() {
             dry_run,
             yes,
         } => {
-            if let Err(error) = calibrate::run(
-                device.as_deref(),
-                stick,
-                trigger,
-                dry_run,
-                yes,
-                trace_packets,
-            ) {
+            let result = usb::reject_nano(device.as_deref(), "calibrate").and_then(|()| {
+                calibrate::run(
+                    device.as_deref(),
+                    stick,
+                    trigger,
+                    dry_run,
+                    yes,
+                    trace_packets,
+                )
+            });
+            if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
         }
         Command::Diag { device, duration } => {
-            if let Err(error) = diag::run(
-                device.as_deref(),
-                duration.map(Duration::from_secs),
-                trace_packets,
-            ) {
+            let result = usb::reject_nano(device.as_deref(), "diag").and_then(|()| {
+                diag::run(
+                    device.as_deref(),
+                    duration.map(Duration::from_secs),
+                    trace_packets,
+                )
+            });
+            if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -242,7 +255,9 @@ fn main() {
         Command::Test {
             action: TestAction::Reset { device },
         } => {
-            if let Err(error) = test_reset(device.as_deref(), trace_packets) {
+            let result = usb::reject_nano(device.as_deref(), "test reset")
+                .and_then(|()| test_reset(device.as_deref(), trace_packets));
+            if let Err(error) = result {
                 eprintln!("Reset test failed: {error}");
                 std::process::exit(1);
             }
@@ -456,10 +471,21 @@ fn format_component(
     text
 }
 
+fn describe_nano(nano: &usb::NanoDevice) -> String {
+    format!(
+        "{}  {:04x}:{:04x}  {}",
+        nano.location(),
+        nano.vendor_id,
+        nano.product_id,
+        nano.model()
+    )
+}
+
 fn list() -> Result<(), String> {
     let controllers = usb::find_controllers()?;
-    if controllers.is_empty() {
-        println!("No Xbox controllers found.");
+    let nanos = usb::find_nano_devices()?;
+    if controllers.is_empty() && nanos.is_empty() {
+        println!("No Xbox controllers or accessories found.");
     }
     for controller in &controllers {
         match controller.serial() {
@@ -471,14 +497,24 @@ fn list() -> Result<(), String> {
             println!("  {}", holders::sentence(&holders));
         }
     }
+    for nano in &nanos {
+        println!("{}", describe_nano(nano));
+    }
     Ok(())
 }
 
 fn info(device: Option<&str>, trace: bool) -> Result<(), String> {
-    let controller = usb::select_controller(device)?;
-    println!("{}", describe(&controller));
-    let mut link = UsbLink::open(&controller, trace)?;
-    print_info(&controller, &mut link)
+    match usb::select_device(device)? {
+        usb::AnyDevice::Gip(controller) => {
+            println!("{}", describe(&controller));
+            let mut link = UsbLink::open(&controller, trace)?;
+            print_info(&controller, &mut link)
+        }
+        usb::AnyDevice::Nano(nano) => {
+            println!("{}", describe_nano(&nano));
+            nano::status(&nano, trace)
+        }
+    }
 }
 
 /// Start the controller and print what it says about itself: the Hello and
@@ -587,8 +623,25 @@ fn download(
     Ok((path, package))
 }
 
-/// Install `image`, or the feed's current firmware when `image` is `None`.
+/// Update firmware, dispatching to the Nano/Pendragon path if the selected
+/// device is one; otherwise the GIP path below.
 fn update(
+    image: Option<&Path>,
+    device: Option<&str>,
+    dry_run: bool,
+    yes: bool,
+    trace: bool,
+) -> Result<(), String> {
+    if let Ok(usb::AnyDevice::Nano(nano)) = usb::select_device(device) {
+        println!("{}", describe_nano(&nano));
+        return nano::update(&nano, image, dry_run, yes, trace);
+    }
+    update_gip(image, device, dry_run, yes, trace)
+}
+
+/// Install `image` on a GIP controller, or the feed's current firmware when
+/// `image` is `None`.
+fn update_gip(
     image: Option<&Path>,
     device: Option<&str>,
     dry_run: bool,
@@ -766,28 +819,16 @@ fn update(
 /// Prints update progress: one line per component, rewritten in place on a
 /// terminal.
 struct Progress {
-    terminal: bool,
+    line: progress::ProgressLine,
     /// Component being written.
     current: Option<(u32, Version)>,
-    /// Width of the progress line currently on screen.
-    open_line: Option<usize>,
-    last_step: Option<u64>,
 }
 
 impl Progress {
     fn new() -> Self {
         Self {
-            terminal: io::stdout().is_terminal(),
+            line: progress::ProgressLine::new(),
             current: None,
-            open_line: None,
-            last_step: None,
-        }
-    }
-
-    /// Keep the progress line and move on, before printing anything else.
-    fn break_line(&mut self) {
-        if self.open_line.take().is_some() {
-            println!();
         }
     }
 
@@ -796,9 +837,8 @@ impl Progress {
             Event::Begin {
                 component, version, ..
             } => {
-                self.break_line();
+                self.line.break_line();
                 self.current = Some((*component, *version));
-                self.last_step = None;
             }
             Event::Block { done, total, .. } => {
                 let Some((component, version)) = self.current else {
@@ -806,47 +846,37 @@ impl Progress {
                 };
                 let percent = u64::from(*done) * 100 / u64::from(*total);
                 let text = format!("  component {component}: writing {version} {percent:>3}%");
-                if self.terminal {
-                    let width = self.open_line.unwrap_or(0);
-                    print!("\r{text:<width$}");
-                    io::stdout().flush().ok();
-                    self.open_line = Some(text.len());
-                } else if self.last_step != Some(percent / 25) {
-                    self.last_step = Some(percent / 25);
-                    println!("{text}");
-                }
+                self.line.update(&text, percent);
             }
             Event::Complete { component } => {
-                if let Some(width) = self.open_line.take() {
-                    print!("\r{:width$}\r", "");
-                }
-                match self.current.take() {
-                    Some((_, version)) => println!("  component {component}: {version} written"),
-                    None => println!("  component {component}: written"),
-                }
+                let text = match self.current.take() {
+                    Some((_, version)) => format!("  component {component}: {version} written"),
+                    None => format!("  component {component}: written"),
+                };
+                self.line.finish(&text);
             }
             Event::Reset => {
-                self.break_line();
+                self.line.break_line();
                 println!("  restarting the controller...");
             }
             Event::Reconnected => println!("  controller is back, continuing"),
             Event::Verified => {
-                self.break_line();
+                self.line.break_line();
                 println!("All components verified.");
             }
             Event::Skipped { component, reason } => {
-                self.break_line();
+                self.line.break_line();
                 println!("  component {component}: skipped ({reason})");
             }
             Event::Retry { op, attempt } => {
-                self.break_line();
+                self.line.break_line();
                 eprintln!(
                     "  no response to {}, retrying (attempt {attempt})",
                     crate::gip::ufu::op_name(*op)
                 );
             }
             Event::FragmentResend { offset } => {
-                self.break_line();
+                self.line.break_line();
                 eprintln!("  transfer interrupted; resending from byte {offset}");
             }
             Event::Info(_)

@@ -10,7 +10,14 @@
 set -eu
 
 repo="bb441db/xboxctl"
-udev_rule='SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}=="ff", ATTR{bDeviceSubClass}=="47", ATTR{bDeviceProtocol}=="d0", TAG+="uaccess"'
+# GIP controllers (matched by USB class) and the Nano Controller / Pendragon
+# family (plain HID devices, matched by VID/PID instead).
+udev_rules='SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}=="ff", ATTR{bDeviceSubClass}=="47", ATTR{bDeviceProtocol}=="d0", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b1d", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b45", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b46", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b4c", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="0b4e", TAG+="uaccess"'
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'xboxctl install: %s\n' "$*" >&2; exit 1; }
@@ -114,8 +121,9 @@ if [ "$os" = linux ]; then
         say ""
         say "To use xboxctl without root, install the udev rule once:"
         say ""
-        say "  echo '$udev_rule' \\"
-        say "    | sudo tee /etc/udev/rules.d/70-xboxctl.rules"
+        say "  sudo tee /etc/udev/rules.d/70-xboxctl.rules >/dev/null <<'EOF'"
+        printf '%s\n' "$udev_rules" | while IFS= read -r line; do say "  $line"; done
+        say "  EOF"
         say "  sudo udevadm control --reload && sudo udevadm trigger"
     fi
 else
