@@ -248,6 +248,9 @@ pub struct UsbLink {
     ids: (u16, u16),
     /// USB serial number; identifies the controller across restarts.
     serial: Option<String>,
+    /// BUS:ADDRESS of this connection, to tell the lingering old device
+    /// from the restarted one.
+    location: String,
     handle: Arc<Handle>,
     packets: mpsc::Receiver<Result<Vec<u8>, String>>,
     stop: Arc<AtomicBool>,
@@ -309,6 +312,7 @@ impl UsbLink {
         Ok(Self {
             ids: (controller.vendor_id, controller.product_id),
             serial: serial_number(controller, &handle),
+            location: controller.location(),
             handle,
             packets,
             stop,
@@ -378,6 +382,13 @@ impl Link for UsbLink {
         let mut hinted = false;
         let mut last_error = None;
         let mut seen = None;
+        // The read error can come while the powering-off controller is still
+        // enumerated (seen on Linux: error at +0 ms, device gone ~1-3 s
+        // later). Reclaiming that old device succeeds, then the next write
+        // fails with an I/O error. So skip the old BUS:ADDRESS until it has
+        // left the bus once; after that it may be reused (as on macOS).
+        let old_location = self.location.clone();
+        let mut old_gone = false;
         loop {
             if self.trace {
                 let devices = microsoft_devices();
@@ -386,9 +397,19 @@ impl Link for UsbLink {
                     seen = Some(devices);
                 }
             }
-            for controller in find_controllers()?
+            let candidates: Vec<Controller> = find_controllers()?
                 .into_iter()
                 .filter(|c| (c.vendor_id, c.product_id) == self.ids)
+                .collect();
+            if !old_gone && !candidates.iter().any(|c| c.location() == old_location) {
+                old_gone = true;
+                if self.trace {
+                    eprintln!("reconnect +{} ms: {old_location} has left the bus", ms());
+                }
+            }
+            for controller in candidates
+                .into_iter()
+                .filter(|c| old_gone || c.location() != old_location)
             {
                 // Right after re-enumeration udev may not have applied the
                 // uaccess permission yet, and xpad may still be binding.
