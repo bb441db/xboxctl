@@ -5,7 +5,7 @@ use crate::gip::frame::{self, Ack, Packet, Sequence};
 use crate::gip::rdhm::{Component, Package, Version};
 use crate::gip::ufu::{self, ComponentVersion, Info, Status};
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// A packet transport to one controller's GIP interrupt endpoints.
@@ -30,6 +30,15 @@ pub struct Options {
     pub ack_timeout: Duration,
     pub reset_timeout: Duration,
     pub iterations: u32,
+    /// Rewrite components in the first pass even when the device already
+    /// reports the package's version.
+    pub force: bool,
+    /// Flash ranges (address, length) to hash once, right after the first
+    /// successful BeginUpdate, while an update is in progress.
+    pub probe: Vec<(u32, u32)>,
+    /// Flash range (address, length) to reconstruct from 2-byte hashes once,
+    /// right after the first successful BeginUpdate. See `read_flash`.
+    pub backup: Option<(u32, u32)>,
 }
 
 impl Default for Options {
@@ -41,6 +50,9 @@ impl Default for Options {
             ack_timeout: Duration::from_millis(500),
             reset_timeout: Duration::from_secs(120),
             iterations: 10,
+            force: false,
+            probe: Vec::new(),
+            backup: None,
         }
     }
 }
@@ -78,6 +90,24 @@ pub enum Event {
         component: u32,
         reason: &'static str,
     },
+    /// Result of a `probe` GetBlockHash: the SHA-1, or why it failed.
+    Probe {
+        address: u32,
+        length: u32,
+        result: Result<[u8; 20], String>,
+    },
+    /// `backup`: bytes reconstructed and verified so far.
+    BackupProgress {
+        done: u32,
+        total: u32,
+    },
+    /// `backup` finished; every 4 KiB block matched the device's own hash.
+    BackupDone {
+        address: u32,
+        data: Vec<u8>,
+    },
+    /// `backup` stopped; the update itself carries on.
+    BackupFailed(String),
     Reset,
     Reconnected,
     Retry {
@@ -363,6 +393,76 @@ impl<'a, L: Link> Updater<'a, L> {
         Info::parse(&response).ok_or_else(|| "malformed GetInfo response".to_owned())
     }
 
+    /// GetBlockHash: the SHA-1 of `length` bytes of flash at `address`.
+    /// Read-only; does not start an update. Some firmware may only answer
+    /// while an update is in progress and then fails with its status.
+    pub fn query_block_hash(&mut self, address: u32, length: u32) -> Result<[u8; 20], String> {
+        let response = self.expect_ok(&ufu::get_block_hash(address, length))?;
+        response
+            .get(2..22)
+            .and_then(|hash| hash.try_into().ok())
+            .ok_or_else(|| "malformed GetBlockHash response".to_owned())
+    }
+
+    /// Reconstruct `length` bytes of flash at `address`. UFU cannot read
+    /// flash, but GetBlockHash accepts lengths down to one byte (seen on a
+    /// MERL controller, 5.23, while an update is in progress), and a 2-byte
+    /// SHA-1 has only 65536 preimages. Every 4 KiB block is then checked
+    /// against the device's hash of the whole block.
+    fn read_flash(&mut self, address: u32, length: u32) -> Result<Vec<u8>, String> {
+        const BLOCK: u32 = 0x1000;
+        let pairs: HashMap<[u8; 20], [u8; 2]> = (0..=u16::MAX)
+            .map(|value| {
+                let bytes = value.to_le_bytes();
+                (Sha1::digest(bytes).into(), bytes)
+            })
+            .collect();
+        let singles: HashMap<[u8; 20], u8> =
+            (0..=u8::MAX).map(|byte| (Sha1::digest([byte]).into(), byte)).collect();
+        address
+            .checked_add(length)
+            .ok_or("backup range overflows")?;
+
+        let mut data = Vec::with_capacity(length as usize);
+        let mut offset = 0u32;
+        while offset < length {
+            let chunk = BLOCK.min(length - offset);
+            let start = address + offset;
+            let mut position = 0u32;
+            while position < chunk {
+                let at = start + position;
+                if chunk - position >= 2 {
+                    let hash = self.query_block_hash(at, 2)?;
+                    let bytes = pairs
+                        .get(&hash)
+                        .ok_or_else(|| format!("hash at {at:#x} matches no 2-byte value"))?;
+                    data.extend_from_slice(bytes);
+                    position += 2;
+                } else {
+                    let hash = self.query_block_hash(at, 1)?;
+                    let byte = singles
+                        .get(&hash)
+                        .ok_or_else(|| format!("hash at {at:#x} matches no byte value"))?;
+                    data.push(*byte);
+                    position += 1;
+                }
+            }
+            let device: [u8; 20] = self.query_block_hash(start, chunk)?;
+            let ours: [u8; 20] = Sha1::digest(&data[offset as usize..]).into();
+            if device != ours {
+                return Err(format!(
+                    "block at {start:#x} does not match the device's hash after reconstruction"
+                ));
+            }
+            offset += chunk;
+            self.emit(Event::BackupProgress {
+                done: offset,
+                total: length,
+            });
+        }
+        Ok(data)
+    }
+
     /// GetVersion for one component; `None` if the device does not have it.
     pub fn query_version(&mut self, component: u32) -> Result<Option<ComponentVersion>, String> {
         match self.request(&ufu::get_version(component))? {
@@ -488,6 +588,32 @@ impl<'a, L: Link> Updater<'a, L> {
             size,
         });
 
+        // Diagnostic hashes, before anything is written. Failures are
+        // reported, not fatal: the update continues either way.
+        for (address, length) in std::mem::take(&mut self.options.probe) {
+            let result = match self.request(&ufu::get_block_hash(address, length)) {
+                Ok((Status::Ok, response)) => response
+                    .get(2..22)
+                    .and_then(|hash| hash.try_into().ok())
+                    .ok_or_else(|| "malformed GetBlockHash response".to_owned()),
+                Ok((status, _)) => Err(format!("status {status:?}")),
+                Err(error) => Err(error),
+            };
+            self.emit(Event::Probe {
+                address,
+                length,
+                result,
+            });
+        }
+        // Same for the backup: a failure is reported and the update goes on,
+        // so the device always ends with its components rewritten.
+        if let Some((address, length)) = self.options.backup.take() {
+            match self.read_flash(address, length) {
+                Ok(data) => self.emit(Event::BackupDone { address, data }),
+                Err(error) => self.emit(Event::BackupFailed(error)),
+            }
+        }
+
         let mut written = 0;
         let mut offset = 0u32;
         while offset < size {
@@ -589,11 +715,12 @@ impl<'a, L: Link> Updater<'a, L> {
 
         let mut verified = false;
         let mut changed = false;
-        for _ in 0..self.options.iterations {
+        for pass in 0..self.options.iterations {
             verified = true;
             for component in &order {
                 let version = self.get_version(component.id)?;
-                if version.version == component.version {
+                let forced = self.options.force && pass == 0;
+                if version.version == component.version && !forced {
                     self.emit(Event::UpToDate {
                         component: component.id,
                     });
@@ -855,6 +982,106 @@ mod tests {
             !events
                 .iter()
                 .any(|e| matches!(e, Event::Begin { .. } | Event::Reset))
+        );
+    }
+
+    #[test]
+    fn forced_rewrite_probes_once_and_writes_nothing_new() {
+        let package = package();
+        let mut link = MockLink::new(Version([5, 17, 3202, 0]));
+        run(&mut link, &package).0.unwrap();
+        link.replug();
+
+        // As `update --only 4,3 --force --probe ...`. Components 4 and 3 share
+        // an address, so 4 alone would overwrite the application; 3 follows.
+        let mut only43 = package.clone();
+        only43.components.retain(|c| c.id == 4 || c.id == 3);
+        let mut events = Vec::new();
+        let mut record = |event: &Event| events.push(event.clone());
+        let options = Options {
+            ack_timeout: Duration::ZERO,
+            force: true,
+            probe: vec![(0x1000_5000, 0x1000), (0x1000_5000, 1)],
+            ..Options::default()
+        };
+        let result = Updater::new(&mut link, options, &mut record).run(&only43);
+        assert_eq!(result, Ok(true));
+        assert!(events.contains(&Event::Order(vec![4, 3])));
+
+        let probes: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Probe { address, length, result } => Some((*address, *length, result.clone())),
+                _ => None,
+            })
+            .collect();
+        let c2 = &package.components[0];
+        assert_eq!(
+            probes,
+            vec![
+                (0x1000_5000, 0x1000, Ok(Sha1::digest(&c2.data[..0x1000]).into())),
+                (0x1000_5000, 1, Ok(Sha1::digest(&c2.data[..1]).into())),
+            ]
+        );
+        // Probes run once, before the first component's blocks.
+        let first_probe = events.iter().position(|e| matches!(e, Event::Probe { .. }));
+        let first_block = events.iter().position(|e| matches!(e, Event::Block { .. }));
+        assert!(first_probe < first_block);
+        // The device ends exactly where it started: 3's image in flash, and
+        // both components at the package's versions.
+        let c3 = package.components.iter().find(|c| c.id == 3).unwrap();
+        let device = &link.endpoint.device;
+        assert_eq!(
+            device.flash(c3.target_address, c3.data.len() as u32).unwrap(),
+            &c3.data[..]
+        );
+        for component in &only43.components {
+            assert_eq!(device.version(component.id), Some(component.version));
+        }
+    }
+
+    #[test]
+    fn backup_reconstructs_flash_from_small_hashes() {
+        let package = package();
+        let mut link = MockLink::new(Version([5, 17, 3202, 0]));
+        run(&mut link, &package).0.unwrap();
+        link.replug();
+
+        let mut only43 = package.clone();
+        only43.components.retain(|c| c.id == 4 || c.id == 3);
+        let c2 = package.components.iter().find(|c| c.id == 2).unwrap();
+        // An odd length exercises the 1-byte tail; 0x1001 spans two blocks.
+        let length = 0x1001;
+        let mut events = Vec::new();
+        let mut record = |event: &Event| events.push(event.clone());
+        let options = Options {
+            ack_timeout: Duration::ZERO,
+            force: true,
+            backup: Some((c2.target_address, length)),
+            ..Options::default()
+        };
+        let result = Updater::new(&mut link, options, &mut record).run(&only43);
+        assert_eq!(result, Ok(true));
+
+        let backups: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::BackupDone { address, data } => Some((*address, data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            backups,
+            vec![(c2.target_address, c2.data[..length as usize].to_vec())]
+        );
+        assert!(events.contains(&Event::BackupProgress {
+            done: length,
+            total: length
+        }));
+        // The backup ran once, inside the first component's update.
+        assert_eq!(
+            events.iter().filter(|e| matches!(e, Event::BackupDone { .. })).count(),
+            1
         );
     }
 

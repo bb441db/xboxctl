@@ -89,6 +89,37 @@ the update finishes. If an update stops partway, unplug the controller, plug
 it back in and run the same command again: it continues with the components
 that still differ.
 
+### Diagnostic update options
+
+These are for investigating a controller, not for normal updates. They were
+used on a Series X|S controller (MERL) going from 5.9 to 5.23.
+
+```bash
+xboxctl update --latest --only 4,3                 # only these component ids; the rest of the package,
+                                                   # including its partition checks, is ignored
+xboxctl update --latest --only 4,3 --force         # rewrite them even if the version matches
+xboxctl update --latest --only 4,3 --force \
+  --probe 0x10026000:0x1000 --probe 0x10005000:2   # GetBlockHash right after BeginUpdate, before writing
+xboxctl backup comp2.bin                           # rebuild 0x22000 bytes at 0x10005000 (see below)
+xboxctl backup boot.bin --address 0x10000000 --length 0x5000
+```
+
+On MERL, components 4 and 3 share flash at `0x10027000`: writing 4 replaces the
+application until 3 is written again. `--only` therefore refuses 4 without 3.
+`--force` applies only when the controller is complete; if an earlier run
+stopped partway, it is ignored and the update is finished normally instead, so
+a forced 4 cannot keep overwriting a 3 that never gets restored.
+
+GetBlockHash fails with `UpdateNotInProgress` outside an update, but during
+one it hashes any range, down to a single byte. `backup` uses that: inside a
+forced `--only 4,3` update, right after the first BeginUpdate and before
+anything is written, it hashes the range two bytes at a time, looks each hash
+up in a table of all 65536 two-byte values, and checks every 4 KiB block
+against the controller's own hash of that block. A failed backup is reported
+and the update continues, so the controller always ends on the same firmware.
+The file is written only when every block matched, and never over an existing
+file. 0x22000 bytes take about 70,000 requests.
+
 Downloads are checked against the SHA-256 in their file name and cached in the
 user cache directory (`~/.cache/xboxctl/firmware` on Linux, `~/Library/Caches/xboxctl/firmware` on
 macOS). Under `sudo` the files still go to, and belong to, the user who ran it.
