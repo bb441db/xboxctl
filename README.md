@@ -297,7 +297,11 @@ supported. The Series X|S controller reports protocol 2 and a 4 KiB write size.
    `min(max_write, 0x1000)` rounded down to 4 bytes.
 3. **GetVersion** for every component in the package. Components whose
    flags have bit 0 set (critical, e.g. the bootloader) are never written.
-   A component larger than the reported partition does not fit this controller.
+   A component larger than the reported partition does not fit this controller,
+   unless the device reports that partition at the component's target address,
+   everything beyond the reported size is `0xff` padding, and that excess
+   overlaps no other component's reported partition (see "From 5.9 to 5.23"
+   below).
 4. **Order**: if component 3 fits its partition (`size < partition_size`),
    update in the order 4, 7, 3, 2, 1, otherwise 2, 1, 4, 7, 3; ids not in the
    package are skipped. The partition size comes from GetVersion if reported.
@@ -377,12 +381,32 @@ and the final check with them.
 | id | flash address | partition | contents |
 |----|---------------|-----------|----------|
 | 1 | `0x10000000` | `0x5000` | bootloader; never updated (5.9.2709.0 on the tested controller) |
-| 2 | `0x10005000` | `0x22000` | encrypted or compressed image |
+| 2 | `0x10005000` | `0x22000` | image with an `sdhi` header at +0x118 (see below); `0x21000` before 5.23 |
 | 3 | `0x10027000` | `0x7e000` | application (Cortex-M); its version is the release version |
 | 4 | `0x10027000` | `0x7e000` | second application image, purpose unknown; own version series (e.g. 5.23.330.0) |
 
 The signed components (1, 3, 4) end in a 0x180-byte block, probably an RSA-3072
 signature that the controller checks; the host performs no signature checks.
+
+#### From 5.9 to 5.23
+
+Before 5.23 the layout was 4 KiB different: component 2 was `0x21000` bytes and
+the application started at `0x10026000` (the `0x7f000` partitions in the
+Windows known-device table). 5.23 moves the application to `0x10027000` and
+grows component 2 to `0x22000`. The size the device reports for component 2
+comes from component 2's own `sdhi` header (`magic, 2, version u16×2, build,
+4, 0, address, size, entry`; 5.9.2709: `0x10005000 0x21000`, 5.23.6:
+`0x10005000 0x22000`), so it changes only once component 2 itself is updated.
+
+A Series X|S controller on 5.9.2709.0 therefore updates in the order 4, 3, 2
+and, after 4 and 3, reports component 2 as `0x21000` bytes at `0x10005000`
+while the package's component 2 is `0x22000`. Its last `0x119a + 0x1000`
+bytes are `0xff`. The page it grows into (`0x10026000`) holds a leftover:
+the 5.9 application's vector table (SP `0x20031350`, reset `0x100261c1`),
+whose handlers point at addresses that 5.23 has overwritten. No component
+reports a partition there, and nothing in the 5.23 images refers to it.
+The controller accepts BeginUpdate for `0x22000` bytes, and afterwards
+reports component 2 as 5.23.6.0, `0x22000` bytes at `0x10005000`.
 
 ### rdhm packages
 

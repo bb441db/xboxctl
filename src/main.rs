@@ -447,8 +447,12 @@ fn format_component(
     if let Some(label) = component_label(vendor_id, product_id, version.component) {
         notes.push(label.to_owned());
     }
-    if let Some(size) = version.partition_size {
-        notes.push(format!("partition {size:#x} bytes"));
+    match (version.partition_address, version.partition_size) {
+        (Some(address), Some(size)) => {
+            notes.push(format!("partition {size:#x} bytes at {address:#010x}"))
+        }
+        (None, Some(size)) => notes.push(format!("partition {size:#x} bytes")),
+        _ => {}
     }
     if !notes.is_empty() {
         text += &format!("  ({})", notes.join(", "));
@@ -667,6 +671,9 @@ fn update(
     let plan = Updater::new(&mut link, Options::default(), &mut ignore)
         .plan(&package)
         .map_err(|error| format!("{error}{}", no_response_hint(&controller, &error)))?;
+    for note in &plan.notes {
+        println!("  note: {note}");
+    }
     for planned in &plan.components {
         if planned.needs_update() {
             println!(
