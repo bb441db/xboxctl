@@ -147,6 +147,79 @@ pub fn update_order<'a>(
 pub struct Plan {
     pub info: Info,
     pub components: Vec<PlannedComponent>,
+    /// Why components larger than their reported partition were accepted.
+    pub notes: Vec<String>,
+}
+
+/// Accept a component larger than the partition the device reports only
+/// when nothing that matters is in the way:
+///
+/// - the device reports the partition at the package's target address,
+/// - everything beyond the reported size is erased padding (0xff), and
+/// - that excess overlaps no other component's reported partition.
+///
+/// This is MERL going from 5.9 to 5.23. Component 2's own image header
+/// (`sdhi` at +0x100) holds the size the device reports: 0x21000 on 5.9,
+/// 0x22000 on 5.23. 5.23 moves the application from 0x10026000 to
+/// 0x10027000 (written first, as components 4 and 3), and component 2 then
+/// grows into the freed page; its last 0x119a+0x1000 bytes are 0xff. Returns
+/// a note describing the growth, or why the component does not fit.
+fn check_fits(
+    component: &Component,
+    layout: &BTreeMap<u32, ComponentVersion>,
+) -> Result<String, String> {
+    let size = component.data.len() as u64;
+    let reported = layout
+        .get(&component.id)
+        .and_then(|v| v.partition_size)
+        .ok_or_else(|| format!("component {} no longer reports its partition", component.id))?;
+    let refuse = |why: String| {
+        Err(format!(
+            "component {} is {size:#x} bytes but the device's partition holds {reported:#x}; \
+             {why}; this package does not fit this controller",
+            component.id
+        ))
+    };
+    match layout[&component.id].partition_address {
+        Some(address) if address == component.target_address => {}
+        Some(address) => {
+            return refuse(format!(
+                "the device has it at {address:#x}, the package at {:#x}",
+                component.target_address
+            ));
+        }
+        None => return refuse("the device does not report where it starts".to_owned()),
+    }
+    let excess = &component.data[reported as usize..];
+    if excess.iter().any(|&byte| byte != 0xff) {
+        return refuse(format!(
+            "the {:#x} bytes beyond it are not erased padding",
+            excess.len()
+        ));
+    }
+    let start = u64::from(component.target_address) + u64::from(reported);
+    let end = u64::from(component.target_address) + size;
+    for (id, other) in layout.iter().filter(|(id, _)| **id != component.id) {
+        let (Some(address), Some(length)) = (other.partition_address, other.partition_size) else {
+            return refuse(format!(
+                "component {id} does not report its partition, so an overlap cannot be ruled out"
+            ));
+        };
+        let (address, length) = (u64::from(address), u64::from(length));
+        if address < end && start < address + length {
+            return refuse(format!(
+                "the excess {start:#x}..{end:#x} overlaps component {id}'s partition \
+                 {address:#x}..{:#x}",
+                address + length
+            ));
+        }
+    }
+    Ok(format!(
+        "component {} grows from {reported:#x} to {size:#x} bytes: the extra {:#x} bytes \
+         ({start:#x}..{end:#x}) are erased padding in flash no other component's partition uses",
+        component.id,
+        size - u64::from(reported)
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,23 +619,35 @@ impl<'a, L: Link> Updater<'a, L> {
             device.insert(component.id, self.get_version(component.id)?);
         }
         // Refuse packages built for another flash layout before writing
-        // anything (e.g. MERL 5.3's 0x7f000 images on 0x7e000 partitions).
+        // anything (e.g. MERL 5.3's 0x7f000 images on 0x7e000 partitions),
+        // unless the excess is padding into unused flash; see `check_fits`.
+        let mut notes = Vec::new();
+        let mut layout: Option<BTreeMap<u32, ComponentVersion>> = None;
         for component in package.components.iter().filter(|c| !c.is_critical()) {
-            if let Some(size) = device.get(&component.id).and_then(|v| v.partition_size)
-                && component.data.len() as u64 > u64::from(size)
-            {
-                return Err(format!(
-                    "component {} is {:#x} bytes but the device's partition holds {size:#x}; \
-                     this package does not fit this controller",
-                    component.id,
-                    component.data.len()
-                ));
+            let Some(reported) = device[&component.id].partition_size else {
+                continue;
+            };
+            if component.data.len() as u64 <= u64::from(reported) {
+                continue;
             }
+            // Only now ask about every component, including ones the package
+            // leaves out: the excess must not touch any of them.
+            if layout.is_none() {
+                let mut all = BTreeMap::new();
+                for id in 1..=7 {
+                    if let Some(version) = self.query_version(id)? {
+                        all.insert(id, version);
+                    }
+                }
+                layout = Some(all);
+            }
+            notes.push(check_fits(component, layout.as_ref().unwrap())?);
         }
         let order = update_order(package, &device);
         self.emit(Event::Order(order.iter().map(|c| c.id).collect()));
         Ok(Plan {
             info,
+            notes,
             components: order
                 .iter()
                 .map(|component| PlannedComponent {
@@ -858,6 +943,74 @@ mod tests {
         );
     }
 
+    /// A MERL controller after 4 and 3 went to 5.23 but 2 is still 5.9: it
+    /// reports component 2's partition as 0x21000, the old size. The package
+    /// stand-in has 0x2100 bytes of component 2, so model 0x2000 + padding.
+    fn old_component2_device() -> MockLink {
+        let mut link = MockLink::new(Version([5, 17, 3202, 0]));
+        run(&mut link, &package()).0.unwrap();
+        link.replug();
+        link.endpoint.device.set_partition(2, 0x1000_5000, 0x2000);
+        link
+    }
+
+    /// Package whose component 2 is `0x2000` bytes of image and `0x100`
+    /// bytes of `tail`, and a version the device does not have yet.
+    fn package_with_component2_tail(tail: u8) -> Package {
+        let mut package = package();
+        let c2 = package.components.iter_mut().find(|c| c.id == 2).unwrap();
+        c2.data[0x2000..].fill(tail);
+        c2.version = Version([5, 23, 7, 0]);
+        package
+    }
+
+    #[test]
+    fn grows_component_into_unused_flash_when_excess_is_padding() {
+        let package = package_with_component2_tail(0xff);
+        let mut link = old_component2_device();
+        let (result, events) = run(&mut link, &package);
+        assert_eq!(result, Ok(true));
+        assert!(events.contains(&Event::Begin {
+            component: 2,
+            version: Version([5, 23, 7, 0]),
+            size: 0x2100,
+        }));
+        let c2 = package.components.iter().find(|c| c.id == 2).unwrap();
+        assert_eq!(
+            link.endpoint.device.flash(c2.target_address, 0x2100).unwrap(),
+            &c2.data[..]
+        );
+    }
+
+    #[test]
+    fn refuses_growth_when_excess_is_not_padding() {
+        let package = package_with_component2_tail(0x00);
+        let mut link = old_component2_device();
+        let (result, events) = run(&mut link, &package);
+        assert!(result.unwrap_err().contains("not erased padding"));
+        assert!(!events.iter().any(|e| matches!(e, Event::Begin { .. })));
+    }
+
+    #[test]
+    fn refuses_growth_into_another_partition() {
+        // As if the 5.9 application still started right after component 2.
+        let package = package_with_component2_tail(0xff);
+        let mut link = old_component2_device();
+        link.endpoint.device.set_partition(3, 0x1000_7000, 0x7f000);
+        let (result, events) = run(&mut link, &package);
+        assert!(result.unwrap_err().contains("overlaps component 3"));
+        assert!(!events.iter().any(|e| matches!(e, Event::Begin { .. })));
+    }
+
+    #[test]
+    fn refuses_growth_at_another_address() {
+        let package = package_with_component2_tail(0xff);
+        let mut link = old_component2_device();
+        link.endpoint.device.set_partition(2, 0x1000_6000, 0x2000);
+        let (result, _) = run(&mut link, &package);
+        assert!(result.unwrap_err().contains("the device has it at"));
+    }
+
     #[test]
     fn refuses_component_larger_than_partition() {
         let mut package = package();
@@ -889,6 +1042,62 @@ mod tests {
         for component in package.components.iter().filter(|c| !c.is_critical()) {
             assert_eq!(device.version(component.id), Some(component.version));
         }
+    }
+
+    /// The state of a physical controller after `update --latest` stopped on
+    /// the partition check: 1 and 2 on 5.9.2709.0 (2 reporting 0x21000 at
+    /// 0x10005000), 3 and 4 on 5.23 at 0x10027000. The official package must
+    /// now be accepted, write only component 2, and leave 3 untouched.
+    /// `GIP_TEST_PACKAGE=<MERL 5.23.6.0 rdhm> cargo test -- --ignored`
+    #[test]
+    #[ignore = "needs an official rdhm package"]
+    fn finishes_merl_5_9_to_5_23_with_official_package() {
+        let path = std::env::var("GIP_TEST_PACKAGE").expect("set GIP_TEST_PACKAGE");
+        let package = Package::parse(&std::fs::read(path).unwrap()).unwrap();
+        let mut link = MockLink::new(Version([5, 17, 3202, 0]));
+        run(&mut link, &package).0.unwrap();
+        link.replug();
+        let old = Version([5, 9, 2709, 0]);
+        let device = &mut link.endpoint.device;
+        device.set_version(1, old);
+        device.set_version(2, old);
+        device.set_partition(2, 0x1000_5000, 0x21000);
+        let c3 = package.components.iter().find(|c| c.id == 3).unwrap();
+        let app_before = device
+            .flash(c3.target_address, c3.data.len() as u32)
+            .unwrap()
+            .to_vec();
+
+        let mut events = Vec::new();
+        let mut record = |event: &Event| events.push(event.clone());
+        let options = Options {
+            ack_timeout: Duration::ZERO,
+            ..Options::default()
+        };
+        let plan = Updater::new(&mut link, options.clone(), &mut record)
+            .plan(&package)
+            .unwrap();
+        assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+        assert!(plan.notes[0].contains("0x10026000..0x10027000"), "{}", plan.notes[0]);
+
+        let result = Updater::new(&mut link, options, &mut record).run(&package);
+        assert_eq!(result, Ok(true));
+        let begins: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Begin { component, .. } => Some(*component),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(begins, vec![2]);
+        let device = &link.endpoint.device;
+        let c2 = package.components.iter().find(|c| c.id == 2).unwrap();
+        assert_eq!(device.flash(0x1000_5000, 0x22000).unwrap(), &c2.data[..]);
+        assert_eq!(
+            device.flash(c3.target_address, c3.data.len() as u32).unwrap(),
+            &app_before[..]
+        );
+        assert_eq!(device.version(2), Some(c2.version));
     }
 
     #[test]

@@ -10,10 +10,15 @@ use std::collections::BTreeMap;
 /// MERL (045e:0b12) flash: every component target address fits in here.
 pub const MERL_FLASH_BASE: u32 = 0x1000_0000;
 pub const MERL_FLASH_SIZE: u32 = 0xa6000;
-/// Partition sizes a physical MERL controller (5.23.6.0) reports in its
-/// GetVersion responses.
-pub const MERL_PARTITIONS: [(u32, u32); 4] =
-    [(1, 0x5000), (2, 0x22000), (3, 0x7e000), (4, 0x7e000)];
+/// Partitions (id, address, size) a physical MERL controller (5.23.6.0)
+/// reports in its GetVersion responses. Addresses of 3 and 4 were seen on
+/// the wire; those of 1 and 2 follow the package's target addresses.
+pub const MERL_PARTITIONS: [(u32, u32, u32); 4] = [
+    (1, 0x1000_0000, 0x5000),
+    (2, 0x1000_5000, 0x22000),
+    (3, 0x1002_7000, 0x7e000),
+    (4, 0x1002_7000, 0x7e000),
+];
 
 #[derive(Debug, Clone, Copy)]
 struct Active {
@@ -30,7 +35,8 @@ pub struct UfuDevice {
     flash_base: u32,
     flash: Vec<u8>,
     versions: BTreeMap<u32, Version>,
-    partitions: BTreeMap<u32, u32>,
+    /// Reported partition per component: (address, size).
+    partitions: BTreeMap<u32, (u32, u32)>,
     /// BeginUpdate for component 4 already asked for its restart.
     begin4_reset_done: bool,
     active: Option<Active>,
@@ -51,10 +57,26 @@ impl UfuDevice {
             flash_base: MERL_FLASH_BASE,
             flash: vec![0xff; MERL_FLASH_SIZE as usize],
             versions: (1..=4).map(|id| (id, version)).collect(),
-            partitions: MERL_PARTITIONS.into_iter().collect(),
+            partitions: MERL_PARTITIONS
+                .into_iter()
+                .map(|(id, address, size)| (id, (address, size)))
+                .collect(),
             begin4_reset_done: false,
             active: None,
         }
+    }
+
+    /// Change the partition a component reports, e.g. to model a controller
+    /// whose installed component 2 is 5.9 (0x21000 bytes).
+    #[cfg(test)]
+    pub fn set_partition(&mut self, component: u32, address: u32, size: u32) {
+        self.partitions.insert(component, (address, size));
+    }
+
+    /// Change the version a component reports.
+    #[cfg(test)]
+    pub fn set_version(&mut self, component: u32, version: Version) {
+        self.versions.insert(component, version);
     }
 
     pub fn version(&self, component: u32) -> Option<Version> {
@@ -96,12 +118,13 @@ impl UfuDevice {
                             Some(version) => response[6..14].copy_from_slice(&version.to_le()),
                             None => response[1] = Status::UnknownComponent as u8,
                         }
-                        if let (Some(_), Some(size)) =
+                        if let (Some(_), Some((address, size))) =
                             (self.versions.get(&id), self.partitions.get(&id))
                         {
-                            // Optional tail: magic, 4 unknown bytes, partition size.
+                            // Optional tail: magic, partition address and size.
                             response.resize(26, 0);
                             response[14..18].copy_from_slice(&ufu::PARTITION_MAGIC.to_le_bytes());
+                            response[18..22].copy_from_slice(&address.to_le_bytes());
                             response[22..26].copy_from_slice(&size.to_le_bytes());
                         }
                     }

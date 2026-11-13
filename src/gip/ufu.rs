@@ -164,6 +164,9 @@ pub const PARTITION_MAGIC: u32 = 0x1a25_3a45;
 pub struct ComponentVersion {
     pub component: u32,
     pub version: Version,
+    /// Flash address of the partition, from the optional tail. A MERL
+    /// controller on 5.23 reports 0x10027000 for components 3 and 4.
+    pub partition_address: Option<u32>,
     pub partition_size: Option<u32>,
 }
 
@@ -172,13 +175,13 @@ impl ComponentVersion {
         if payload.len() < MIN_RESPONSE[GET_VERSION as usize] {
             return None;
         }
-        let partition_size = (payload.len() >= 26
-            && u32::from_le_bytes(payload[14..18].try_into().unwrap()) == PARTITION_MAGIC)
-            .then(|| u32::from_le_bytes(payload[22..26].try_into().unwrap()));
+        let word = |at: usize| u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
+        let tail = payload.len() >= 26 && word(14) == PARTITION_MAGIC;
         Some(Self {
-            component: u32::from_le_bytes(payload[2..6].try_into().unwrap()),
+            component: word(2),
             version: Version::from_le(&payload[6..14]),
-            partition_size,
+            partition_address: tail.then(|| word(18)),
+            partition_size: tail.then(|| word(22)),
         })
     }
 }
