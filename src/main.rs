@@ -93,6 +93,39 @@ enum Command {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// Only update these component ids (comma separated); the rest of
+        /// the package is ignored, including its size checks.
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<u32>,
+        /// Rewrite the selected components even if their version matches.
+        /// On MERL, components 4 and 3 share flash: force them together
+        /// (--only 4,3), never 4 alone.
+        #[arg(long, requires = "only")]
+        force: bool,
+        /// Hash ADDRESS:LENGTH right after BeginUpdate, before writing
+        /// (repeatable). Diagnostic; needs --only.
+        #[arg(long, requires = "only", value_parser = parse_range)]
+        probe: Vec<(u32, u32)>,
+    },
+    /// Back up a range of flash that UFU cannot read directly, by rebuilding
+    /// it from 2-byte GetBlockHash results. The device only answers those
+    /// during an update, so this reinstalls components 4 and 3 from the
+    /// latest firmware around it; the controller ends on the same firmware.
+    Backup {
+        /// File to write; it must not exist yet.
+        output: PathBuf,
+        /// Controller to use, as BUS:ADDRESS from `xboxctl list`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Start address (default: component 2 on MERL).
+        #[arg(long, value_parser = parse_u32, default_value = "0x10005000")]
+        address: u32,
+        /// Number of bytes (default: component 2 plus the 4 KiB after it).
+        #[arg(long, value_parser = parse_u32, default_value = "0x22000")]
+        length: u32,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Run each of the controller's rumble motors for a moment, to tell a
     /// controller fault from a driver problem. Changes nothing on the
@@ -174,6 +207,24 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Backup {
+            output,
+            device,
+            address,
+            length,
+            yes,
+        } => {
+            let extra = UpdateExtras {
+                only: vec![4, 3],
+                force: true,
+                probe: Vec::new(),
+                backup: Some((address, length, output)),
+            };
+            if let Err(error) = update(None, device.as_deref(), false, yes, extra, trace_packets) {
+                eprintln!("Backup failed: {error}");
+                std::process::exit(1);
+            }
+        }
         Command::Download {
             device,
             id,
@@ -196,9 +247,20 @@ fn main() {
             device,
             dry_run,
             yes,
+            only,
+            force,
+            probe,
         } => {
             let source = if latest { None } else { image.as_deref() };
-            if let Err(error) = update(source, device.as_deref(), dry_run, yes, trace_packets) {
+            let extra = UpdateExtras {
+                only,
+                force,
+                probe,
+                backup: None,
+            };
+            if let Err(error) =
+                update(source, device.as_deref(), dry_run, yes, extra, trace_packets)
+            {
                 eprintln!("Update failed: {error}");
                 std::process::exit(1);
             }
@@ -481,6 +543,15 @@ fn info(device: Option<&str>, trace: bool) -> Result<(), String> {
     print_info(&controller, &mut link)
 }
 
+/// Parse a decimal or `0x`-prefixed hexadecimal u32.
+fn parse_u32(text: &str) -> Result<u32, String> {
+    let parsed = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => text.parse(),
+    };
+    parsed.map_err(|error| format!("invalid number {text:?}: {error}"))
+}
+
 /// Start the controller and print what it says about itself: the Hello and
 /// the firmware components.
 fn print_info(controller: &Controller, link: &mut UsbLink) -> Result<(), String> {
@@ -588,14 +659,49 @@ fn download(
 }
 
 /// Install `image`, or the feed's current firmware when `image` is `None`.
+/// Options for `update` beyond the upstream ones: component selection,
+/// forced rewrites and diagnostic hashes.
+struct UpdateExtras {
+    only: Vec<u32>,
+    force: bool,
+    probe: Vec<(u32, u32)>,
+    /// Flash range to back up during the update, and the file to save it to.
+    backup: Option<(u32, u32, PathBuf)>,
+}
+
+/// Parse `ADDRESS:LENGTH`, each decimal or 0x-hexadecimal.
+fn parse_range(text: &str) -> Result<(u32, u32), String> {
+    let (address, length) = text
+        .split_once(':')
+        .ok_or_else(|| format!("expected ADDRESS:LENGTH, got {text:?}"))?;
+    let length = parse_u32(length)?;
+    if length == 0 {
+        return Err("length must be at least 1".to_owned());
+    }
+    Ok((parse_u32(address)?, length))
+}
+
 fn update(
     image: Option<&Path>,
     device: Option<&str>,
     dry_run: bool,
     yes: bool,
+    extra: UpdateExtras,
     trace: bool,
 ) -> Result<(), String> {
-    let package = match image {
+    // Check the backup file before a long run, not after it.
+    if let Some((_, length, path)) = &extra.backup {
+        if *length == 0 {
+            return Err("backup length must be at least 1".to_owned());
+        }
+        if path.exists() {
+            return Err(format!(
+                "{} already exists; choose another file so no backup is overwritten",
+                path.display()
+            ));
+        }
+    }
+    let mut package = match image {
         Some(image) => {
             let bytes = fs::read(image)
                 .map_err(|error| format!("could not read {}: {error}", image.display()))?;
@@ -603,6 +709,26 @@ fn update(
         }
         None => download(device, None, None)?.1,
     };
+    if !extra.only.is_empty() {
+        if let Some(missing) = extra
+            .only
+            .iter()
+            .find(|id| !package.components.iter().any(|c| c.id == **id))
+        {
+            return Err(format!("the package has no component {missing}"));
+        }
+        // Components 4 and 3 target the same flash: writing 4 replaces the
+        // application, which only a following write of 3 restores.
+        if extra.only.contains(&4) && !extra.only.contains(&3) {
+            return Err(
+                "component 4 shares flash with component 3 (the application); \
+                 use --only 4,3 so the application is written back afterwards"
+                    .to_owned(),
+            );
+        }
+        package.components.retain(|c| extra.only.contains(&c.id));
+        println!("Only updating component(s) {:?}", extra.only);
+    }
     println!(
         "Package: firmware {} for {:04x}:{:04x}",
         package.version, package.vendor_id, package.product_id
@@ -680,7 +806,16 @@ fn update(
             );
         }
     }
-    if !plan.needs_update() {
+    // Force only a device that is complete. If a component already differs,
+    // an earlier run stopped partway: finish it normally. Forcing again would
+    // rewrite 4 (overwriting the application) before 3 is ever restored.
+    let force = extra.force && !plan.needs_update();
+    if force {
+        println!("  --force: rewriting the selected components anyway");
+    } else if extra.force {
+        println!("  --force ignored: an earlier update is unfinished; completing it first");
+    }
+    if !plan.needs_update() && !force {
         println!("The controller already runs this firmware; nothing to do.");
         return Ok(());
     }
@@ -711,9 +846,36 @@ fn update(
     let mut report = |event: &Event| progress.event(event);
     // Already written blocks are skipped on the next run, so an interrupted
     // update continues where it stopped.
-    Updater::new(&mut link, Options::default(), &mut report)
-        .run(&package)
-        .map_err(|error| {
+    let options = Options {
+        force,
+        probe: extra.probe,
+        backup: extra.backup.as_ref().map(|(address, length, _)| (*address, *length)),
+        ..Options::default()
+    };
+    let result = Updater::new(&mut link, options, &mut report).run(&package);
+    // Save the backup even if the update failed afterwards: it was verified
+    // block by block before anything was written.
+    if let Some((_, _, path)) = &extra.backup {
+        match progress.backup.take() {
+            Some((address, data)) => {
+                use sha2::{Digest, Sha256};
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(&data))
+                    .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+                println!(
+                    "Backup saved: {} ({:#x} bytes from {address:#010x}, SHA-256 {})",
+                    path.display(),
+                    data.len(),
+                    usb::hex(&Sha256::digest(&data)).replace(' ', "")
+                );
+            }
+            None => println!("No backup was made."),
+        }
+    }
+    result.map_err(|error| {
             format!(
                 "{error}{}\nUnplug the controller, plug it back in and run the same command \
                  again: the update continues with the components that still differ.",
@@ -772,6 +934,8 @@ struct Progress {
     /// Width of the progress line currently on screen.
     open_line: Option<usize>,
     last_step: Option<u64>,
+    /// Verified backup data (address, bytes), kept for the caller to save.
+    backup: Option<(u32, Vec<u8>)>,
 }
 
 impl Progress {
@@ -781,6 +945,21 @@ impl Progress {
             current: None,
             open_line: None,
             last_step: None,
+            backup: None,
+        }
+    }
+
+    /// Show `text` as the current progress line: rewritten in place on a
+    /// terminal, otherwise printed at every quarter.
+    fn progress_line(&mut self, text: String, percent: u64) {
+        if self.terminal {
+            let width = self.open_line.unwrap_or(0);
+            print!("\r{text:<width$}");
+            io::stdout().flush().ok();
+            self.open_line = Some(text.len());
+        } else if self.last_step != Some(percent / 25) {
+            self.last_step = Some(percent / 25);
+            println!("{text}");
         }
     }
 
@@ -828,6 +1007,53 @@ impl Progress {
             Event::Reset => {
                 self.break_line();
                 println!("  restarting the controller...");
+            }
+            Event::Probe {
+                address,
+                length,
+                result,
+            } => {
+                use sha1::{Digest, Sha1};
+                self.break_line();
+                match result {
+                    Ok(digest) => {
+                        let note = if Sha1::digest(vec![0xff; *length as usize])[..] == digest[..] {
+                            "  (erased: all 0xff)"
+                        } else if Sha1::digest(vec![0x00; *length as usize])[..] == digest[..] {
+                            "  (all 0x00)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "  probe {address:#010x} +{length:#x}  {}{note}",
+                            usb::hex(digest).replace(' ', "")
+                        );
+                    }
+                    Err(error) => println!("  probe {address:#010x} +{length:#x}  failed: {error}"),
+                }
+            }
+            Event::BackupProgress { done, total } => {
+                let percent = u64::from(*done) * 100 / u64::from(*total);
+                self.progress_line(
+                    format!("  backup: {done:#x} of {total:#x} bytes verified {percent:>3}%"),
+                    percent,
+                );
+            }
+            Event::BackupDone { address, data } => {
+                if let Some(width) = self.open_line.take() {
+                    print!("\r{:width$}\r", "");
+                }
+                self.last_step = None;
+                println!(
+                    "  backup: {:#x} bytes at {address:#010x} read, every 4 KiB block verified",
+                    data.len()
+                );
+                self.backup = Some((*address, data.clone()));
+            }
+            Event::BackupFailed(error) => {
+                self.break_line();
+                self.last_step = None;
+                println!("  backup FAILED: {error} (the update continues)");
             }
             Event::Reconnected => println!("  controller is back, continuing"),
             Event::Verified => {
