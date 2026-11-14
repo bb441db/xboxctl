@@ -25,10 +25,11 @@ xboxctl update --latest      # current firmware for its hardware revision, from 
 xboxctl update <image.bin>   # a PPAS firmware image
 ```
 
-This has been checked against an emulated Nano in QEMU over a real USB HID
-connection, including a full firmware update (session, device info, and the
-write/finish sequence) — **not yet against a physical Nano**; see
-[Open questions](#open-questions).
+Read-only identification and status, and a full `xboxctl` firmware update,
+have been verified against a physical retail Nano. The device updated from
+6.9.444.0 to 6.19.50.0, restarted, and reported the new version afterward.
+The update path has also been exercised in QEMU, including interrupted-transfer
+resume and lost-ack retry.
 
 The rest of this page is reverse engineering notes on the protocol itself and
 on the Xbox Accessories app, from its 2610.2610.13002.0 build (October 2026),
@@ -209,11 +210,22 @@ Update status bytes:
 
 The single bytes in `11`, `12` and `13`: `11`'s flags byte is
 `foreground << 4` (`10` foreground, `00` background); its last reply byte is a
-slot chosen by the device, echoed in every `12` and in `13` (`xboxctl` and the
-fake device above only exercise `0`). `13`'s flags byte is `1` for a
+slot chosen by the device, echoed in every `12` and in `13` (`xboxctl` accepts
+the returned slot; the physical Nano and QEMU profile used here choose `1`).
+`13`'s flags byte is `1` for a
 foreground update, `0` for background; `4` means a user granted update consent
 and is only valid while the device is waiting for it (status mode `5`), which
 `xboxctl` does not implement.
+
+An independent physical Nano test found that the Accessories SDK sends finish
+flags `3` when the device is below the feed entry's required (`req`) version.
+Sending `1` in that case returned success but discarded the staged image after
+restart; `3` applied it. `xboxctl update --latest` now compares the running
+version with `req` and selects the matching finish flags. The same tester
+reported missed fragment acknowledgements during long writes; `xboxctl` retries
+the identical fragment and sequence, and checks the device's staged byte count
+before finishing. The checkout's physical update then completed successfully
+with finish flags `0x03`.
 
 ### Firmware images
 
@@ -266,19 +278,10 @@ service or to Windows.
 
 ## Open questions
 
-- Whether a physical Nano matches all of this, including its report sizes.
-  This is the main thing `xboxctl` itself has not been checked against: only
-  the emulated Nano, over a real USB HID connection, not just the in-process
-  mock its tests use. Relatedly, whether a physical Nano accepts an update
-  driven this way at all — on the emulated Nano, the same foreground sequence
-  the SDK runs on its own (without `XboxAccessoriesService`) is what `xboxctl`
-  uses, and both have updated it successfully.
 - The meaning of external message `1e 02 05`, and the requests behind battery
   level and the other settings pages.
 
-A capture of a real Nano connected to Windows with the Xbox Accessories app
-running would answer most of these, as would running `xboxctl` itself against
-a physical Nano.
+The remaining questions concern undocumented settings and telemetry messages.
 
 ## Emulating a Nano
 

@@ -7,10 +7,11 @@ description: xboxctl is an open source command line tool that updates Xbox contr
 # Update Xbox controller firmware on Linux and macOS
 {: .no_toc }
 
-`xboxctl` inspects and updates the firmware of Xbox (GIP) controllers from
-Linux and macOS, without the Xbox Accessories app. It speaks the same
-[firmware update protocol]({% link protocol.md %}) ("UFU", carried in GIP command `0x0c`) as the
-Windows updater and downloads firmware from the same Microsoft feed.
+`xboxctl` inspects and updates supported Xbox controllers from Linux and
+macOS, without the Xbox Accessories app. GIP controllers use Microsoft's
+[UFU protocol]({% link protocol.md %}); the Xbox Nano uses Microsoft's
+[Companion Protocol]({% link nano.md %}) over HID. Firmware comes from the
+public feed for GIP devices and the flight feed for the Nano.
 
 <details open markdown="block">
   <summary>Contents</summary>
@@ -27,6 +28,7 @@ Wireless Adapter or Bluetooth are not supported.
 | Controller | USB ID | Codename | Tested |
 |------------|--------|----------|:------:|
 | Xbox Series X\|S Controller | `045e:0b12` | MERL | ✅ |
+| Xbox Nano Controller | `045e:0b4e` | TALA | ✅ |
 | Xbox One S Controller | `045e:02ea` | CRET | ✅ |
 | Xbox Elite Controller Series 2 | `045e:0b00` | DELP | ❌ |
 | Xbox Adaptive Controller | `045e:0b0a` | ZEPH | ❌ |
