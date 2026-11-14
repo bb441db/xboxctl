@@ -3,7 +3,9 @@
 
 use crate::companion::firmware::Image;
 use crate::companion::frame::{self, Frame, Reassembler, Sequence, SessionAccept};
-use crate::companion::protocol::{self, DeviceInfo, StartReply, Status, UpdateStatus, WriteReply};
+use crate::companion::protocol::{
+    self, DeviceInfo, LegacyDeviceInfo, StartReply, Status, UpdateStatus, WriteReply,
+};
 use std::time::{Duration, Instant};
 
 /// A packet transport to one Pendragon device's companion HID collection.
@@ -23,12 +25,17 @@ pub trait Link {
 pub struct Options {
     pub session_timeout: Duration,
     pub response_timeout: Duration,
+    /// SDK timeout for start and finish commands.
+    pub mutation_timeout: Duration,
     pub write_timeout: Duration,
     pub ack_timeout: Duration,
     pub attempts: u32,
     /// Matches `UpdateDeviceFirmwareAsync(foreground: true)`, which is the
     /// only path proven to work without `XboxAccessoriesService` running.
     pub foreground: bool,
+    /// Finish flags: the SDK uses 3 for a feed-mandated update, 1 for a
+    /// normal foreground update.
+    pub finish_flags: u8,
 }
 
 impl Default for Options {
@@ -36,10 +43,12 @@ impl Default for Options {
         Self {
             session_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(4),
-            write_timeout: Duration::from_secs(10),
+            mutation_timeout: Duration::from_secs(20),
+            write_timeout: Duration::from_secs(100),
             ack_timeout: Duration::from_millis(500),
             attempts: 5,
             foreground: true,
+            finish_flags: 1,
         }
     }
 }
@@ -52,13 +61,24 @@ pub enum Event {
     Finished,
 }
 
+/// A device's answer to a device-info request: the current full format, or
+/// the shorter legacy one an older negotiated protocol falls back to (no
+/// capabilities or firmware version, see [`LegacyDeviceInfo`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceInfoReply {
+    Full(DeviceInfo),
+    Legacy(LegacyDeviceInfo),
+}
+
 pub struct Session<'a, L: Link> {
     link: &'a mut L,
     options: Options,
     handle: u8,
     /// Smallest of what the host offered and what the device accepted.
     max_message: u16,
+    version: [u8; 3],
     seq: Sequence,
+    last_rx: Option<u8>,
 }
 
 impl<'a, L: Link> Session<'a, L> {
@@ -66,23 +86,43 @@ impl<'a, L: Link> Session<'a, L> {
     /// accept. `session_id` should be unpredictable so a stale reply from a
     /// previous session cannot be mistaken for this one.
     pub fn open(link: &'a mut L, session_id: u32, options: Options) -> Result<Self, String> {
-        link.send(&frame::open_session(session_id))?;
         let deadline = Instant::now() + options.session_timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let Some(bytes) = link.recv(remaining)? else {
-                return Err("device did not accept a session".to_owned());
-            };
-            if let Some(accept) = SessionAccept::parse(&bytes, session_id, 0) {
-                return Ok(Self {
-                    link,
-                    max_message: accept.max_message.min(frame::SESSION_MAX_MESSAGE),
-                    handle: accept.handle,
-                    seq: Sequence::default(),
-                    options,
-                });
+        let attempts = options.attempts.max(1);
+        let interval = options.session_timeout / attempts;
+        for _ in 0..attempts {
+            if Instant::now() >= deadline {
+                break;
+            }
+            link.send(&frame::open_session(session_id))?;
+            let reply_deadline = (Instant::now() + interval).min(deadline);
+            loop {
+                let remaining = reply_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let Some(bytes) = link.recv(remaining)? else {
+                    break;
+                };
+                if let Some(accept) = SessionAccept::parse(&bytes, session_id, 0) {
+                    return Ok(Self {
+                        link,
+                        max_message: accept.max_message.min(frame::SESSION_MAX_MESSAGE),
+                        handle: accept.handle,
+                        version: accept.version,
+                        seq: Sequence::default(),
+                        last_rx: None,
+                        options,
+                    });
+                }
             }
         }
+        Err(format!(
+            "device did not accept a session after {attempts} attempts"
+        ))
+    }
+
+    pub fn set_finish_flags(&mut self, flags: u8) {
+        self.options.finish_flags = flags;
     }
 
     /// Send one message as one or more data frames, waiting for the device's
@@ -95,26 +135,51 @@ impl<'a, L: Link> Session<'a, L> {
         }
         for report in frame::fragments(self.handle, opcode, &mut self.seq, payload, max_data) {
             let sent = Frame::parse(&report).expect("fragments() produces valid frames");
-            self.link.send(&report)?;
             if !sent.is_fragment() {
+                self.link.send(&report)?;
                 continue;
             }
-            let deadline = Instant::now() + self.options.ack_timeout;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let Some(bytes) = self.link.recv(remaining)? else {
-                    return Err("no ack for a message fragment".to_owned());
-                };
-                let Some(ack) = Frame::parse(&bytes) else {
-                    continue;
-                };
-                if ack.kind == frame::TYPE_ACK
-                    && ack.handle == self.handle
-                    && ack.opcode == opcode
-                    && ack.seq == sent.seq.wrapping_add(1)
-                {
+            let sends = self.options.attempts.max(1);
+            let mut acked = false;
+            for _ in 0..sends {
+                self.link.send(&report)?;
+                let deadline = Instant::now() + self.options.ack_timeout;
+                while !acked {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let Some(bytes) = self.link.recv(remaining)? else {
+                        break;
+                    };
+                    let Some(reply) = Frame::parse(&bytes) else {
+                        continue;
+                    };
+                    if reply.kind == frame::TYPE_ACK
+                        && reply.handle == self.handle
+                        && reply.opcode == opcode
+                        && reply.seq == sent.seq.wrapping_add(1)
+                    {
+                        acked = true;
+                        break;
+                    }
+                    // Other device traffic can arrive while a write fragment
+                    // is awaiting its ack. Ack it so it cannot clog the HID
+                    // queue; retry the exact same fragment/sequence below.
+                    if reply.kind != frame::TYPE_ACK {
+                        self.link
+                            .send(&frame::ack(reply.handle, reply.opcode, reply.seq))?;
+                    }
+                }
+                if acked {
                     break;
                 }
+            }
+            if !acked {
+                return Err(format!(
+                    "no ack for message fragment {:#04x} after {sends} sends",
+                    sent.seq
+                ));
             }
         }
         Ok(())
@@ -128,10 +193,21 @@ impl<'a, L: Link> Session<'a, L> {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, String> {
-        for _ in 0..self.options.attempts {
+        self.request_with_attempts(opcode, payload, timeout, self.options.attempts)
+    }
+
+    fn request_with_attempts(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        timeout: Duration,
+        attempts: u32,
+    ) -> Result<Vec<u8>, String> {
+        for _ in 0..attempts {
             self.send_message(opcode, payload)?;
             let deadline = Instant::now() + timeout;
             let mut reassembler = Reassembler::default();
+            let mut expected = None;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let Some(bytes) = self.link.recv(remaining)? else {
@@ -140,62 +216,103 @@ impl<'a, L: Link> Session<'a, L> {
                 let Some(frame) = Frame::parse(&bytes) else {
                     continue;
                 };
-                if frame.kind == frame::TYPE_ACK || frame.opcode != opcode {
+                if frame.kind == frame::TYPE_ACK {
                     continue;
                 }
-                if frame.is_fragment() {
-                    self.link
-                        .send(&frame::ack(self.handle, opcode, frame.seq))?;
+                // A real Nano expects an ack for every data frame it sends,
+                // not only fragmented ones: a single-frame reply that goes
+                // unacked is retransmitted forever, confirmed 2026-11-14
+                // against physical hardware (see research/nano/README.md).
+                self.link
+                    .send(&frame::ack(frame.handle, frame.opcode, frame.seq))?;
+                if frame.handle != self.handle || frame.opcode != opcode {
+                    continue;
                 }
+                if matches!(frame.kind, frame::TYPE_SINGLE | frame::TYPE_FIRST) {
+                    if self
+                        .last_rx
+                        .is_some_and(|last| frame.seq.wrapping_sub(last).wrapping_sub(1) >= 0x80)
+                    {
+                        continue;
+                    }
+                    self.last_rx = Some(frame.seq);
+                } else if expected != Some(frame.seq) {
+                    continue;
+                }
+                expected = Some(frame.seq.wrapping_add(1));
                 if let Some(message) = reassembler.push(&frame) {
                     return Ok(message);
                 }
             }
         }
         Err(format!(
-            "no response to opcode {opcode:#04x} after {} attempts",
-            self.options.attempts
+            "no response to opcode {opcode:#04x} after {attempts} attempts"
         ))
     }
 
-    pub fn device_info(&mut self) -> Result<DeviceInfo, String> {
-        let response = self.request(
-            protocol::OP_DEVICE_INFO,
-            &protocol::device_info_request(),
-            self.options.response_timeout,
-        )?;
-        DeviceInfo::parse(&response).ok_or_else(|| "malformed device information reply".to_owned())
+    /// Select the device-info opcode from the version negotiated at session
+    /// open. Older protocol versions use `0x23`, with `0x1c` as a fallback.
+    pub fn device_info(&mut self) -> Result<DeviceInfoReply, String> {
+        let payload = protocol::device_info_request();
+        let opcode = protocol::device_info_opcode(self.version);
+        let response = match self.request(opcode, &payload, self.options.response_timeout) {
+            Ok(response) => response,
+            Err(_) if opcode == protocol::OP_DEVICE_INFO_LEGACY => self.request(
+                protocol::OP_DEVICE_INFO_OLD_1,
+                &payload,
+                self.options.response_timeout,
+            )?,
+            Err(error) => return Err(error),
+        };
+        if opcode == protocol::OP_DEVICE_INFO_LEGACY {
+            LegacyDeviceInfo::parse(&response)
+                .map(DeviceInfoReply::Legacy)
+                .ok_or_else(|| "malformed legacy device information reply".to_owned())
+        } else {
+            DeviceInfo::parse(&response)
+                .map(DeviceInfoReply::Full)
+                .ok_or_else(|| "malformed device information reply".to_owned())
+        }
     }
 
-    fn update_status(&mut self) -> Result<UpdateStatus, String> {
+    /// `03`/`14`: read-only (no write, no state change on the device) even
+    /// though it lives under the update opcode; callers use it to learn the
+    /// running firmware version when the legacy device-info format carries no
+    /// version.
+    pub fn update_status(&mut self) -> Result<UpdateStatus, String> {
         let timeout = self.options.response_timeout;
         let response = self.request(protocol::OP_UPDATE, &protocol::status_request(), timeout)?;
         UpdateStatus::parse(&response).ok_or_else(|| "malformed update status reply".to_owned())
     }
 
-    fn start_update(&mut self, status: &UpdateStatus, image: &Image) -> Result<StartReply, String> {
-        let timeout = self.options.response_timeout;
+    pub(crate) fn start_update(
+        &mut self,
+        status: &UpdateStatus,
+        image: &Image,
+    ) -> Result<StartReply, String> {
+        let timeout = self.options.mutation_timeout;
         let request = protocol::start_request(
             status.token,
             image.version,
             self.options.foreground,
             status.mode,
         );
-        let response = self.request(protocol::OP_UPDATE, &request, timeout)?;
+        let response = self.request_with_attempts(protocol::OP_UPDATE, &request, timeout, 1)?;
         StartReply::parse(&response).ok_or_else(|| "malformed update start reply".to_owned())
     }
 
     fn write_block(&mut self, slot: u8, offset: u32, data: &[u8]) -> Result<WriteReply, String> {
         let timeout = self.options.write_timeout;
         let request = protocol::write_request(slot, offset, data);
-        let response = self.request(protocol::OP_UPDATE, &request, timeout)?;
-        WriteReply::parse(&response).ok_or_else(|| "malformed write reply".to_owned())
+        let response = self.request_with_attempts(protocol::OP_UPDATE, &request, timeout, 1)?;
+        WriteReply::parse_for_version(&response, self.version)
+            .ok_or_else(|| "malformed write reply".to_owned())
     }
 
     fn finish_update(&mut self, slot: u8) -> Result<Status, String> {
-        let timeout = self.options.response_timeout;
-        let request = protocol::finish_request(slot, self.options.foreground);
-        let response = self.request(protocol::OP_UPDATE, &request, timeout)?;
+        let timeout = self.options.mutation_timeout;
+        let request = protocol::finish_request_with_flags(slot, self.options.finish_flags);
+        let response = self.request_with_attempts(protocol::OP_UPDATE, &request, timeout, 1)?;
         protocol::finish_status(&response).ok_or_else(|| "malformed finish reply".to_owned())
     }
 
@@ -204,6 +321,16 @@ impl<'a, L: Link> Session<'a, L> {
     /// into the new firmware by itself a second or two after finishing; this
     /// does not wait for that.
     pub fn update(&mut self, image: &Image, events: &mut dyn FnMut(&Event)) -> Result<(), String> {
+        if image.data.len() > 0x00ff_ffff {
+            return Err(
+                "firmware image exceeds the 24-bit transfer limit; not starting".to_owned(),
+            );
+        }
+        if self.max_message <= 5 {
+            return Err(
+                "negotiated message size cannot hold a firmware block; not starting".to_owned(),
+            );
+        }
         let status = self.update_status()?;
         if !matches!(status.status, Status::Ok | Status::NotUpdating) {
             return Err(format!("device reported update status {:?}", status.status));
@@ -217,20 +344,27 @@ impl<'a, L: Link> Session<'a, L> {
                 "device is waiting for update consent (mode 5); this is not implemented".to_owned(),
             );
         }
+        if status.max_chunk == 0 {
+            return Err("device reports a zero maximum write size; not starting".to_owned());
+        }
 
         let start = self.start_update(&status, image)?;
         if start.status != Status::Ok {
             return Err(format!("update start failed: {:?}", start.status));
         }
         let total = image.data.len() as u32;
+        if start.resume_offset > total {
+            return Err(format!(
+                "resume offset {} exceeds image size {total}; not writing or finishing",
+                start.resume_offset
+            ));
+        }
         events(&Event::Begin {
             resume_offset: start.resume_offset,
             total,
         });
 
-        let chunk = (usize::from(self.max_message).saturating_sub(5))
-            .min(usize::from(status.max_chunk))
-            .max(1);
+        let chunk = (usize::from(self.max_message) - 5).min(usize::from(status.max_chunk));
         let mut offset = start.resume_offset as usize;
         while offset < image.data.len() {
             let end = (offset + chunk).min(image.data.len());
@@ -243,6 +377,22 @@ impl<'a, L: Link> Session<'a, L> {
                 done: offset as u32,
                 total,
             });
+        }
+
+        let final_status = self.update_status()?;
+        if final_status.status != Status::Ok {
+            return Err(format!(
+                "device reported final update status {:?}; not finishing",
+                final_status.status
+            ));
+        }
+        let written = final_status
+            .bytes_written
+            .ok_or_else(|| "device did not report bytes written; not finishing".to_owned())?;
+        if written != total {
+            return Err(format!(
+                "device reports {written} of {total} bytes written; not finishing"
+            ));
         }
 
         let status = self.finish_update(start.slot)?;
@@ -297,7 +447,9 @@ mod tests {
     fn reads_fragmented_device_info() {
         let mut link = MockLink::new([6, 19, 49, 0]);
         let mut session = open(&mut link);
-        let info = session.device_info().unwrap();
+        let DeviceInfoReply::Full(info) = session.device_info().unwrap() else {
+            panic!("expected the full device info format");
+        };
         assert_eq!((info.vendor_id, info.product_id), (0x045e, 0x0b4c));
         assert_eq!(info.hardware_revision, 0x0c06);
         assert_eq!(info.firmware_version, [6, 19, 49, 0]);

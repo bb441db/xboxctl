@@ -48,6 +48,7 @@ pub struct SessionAccept {
     pub handle: u8,
     pub session_id: u32,
     pub version_major: u8,
+    pub version: [u8; 3],
     pub max_message: u16,
 }
 
@@ -75,6 +76,7 @@ impl SessionAccept {
             handle: seq,
             session_id,
             version_major,
+            version: [bytes[6], bytes[7], bytes[8]],
             max_message: u16::from_le_bytes([bytes[9], bytes[10]]),
         })
     }

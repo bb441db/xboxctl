@@ -6,6 +6,19 @@
 //! flag bytes) are left as documented there.
 
 pub const OP_DEVICE_INFO: u8 = 0x2e;
+pub const OP_DEVICE_INFO_LEGACY: u8 = 0x23;
+/// Older-info fallback opcodes. On Companion versions before 2.0.22, use
+/// `0x23`; its reply includes capabilities on retail Nano hardware. `0x1c`
+/// is retained as a one-shot fallback for devices that do not answer `0x23`.
+pub const OP_DEVICE_INFO_OLD_1: u8 = 0x1c;
+
+pub fn device_info_opcode(version: [u8; 3]) -> u8 {
+    if version < [2, 0, 22] {
+        OP_DEVICE_INFO_LEGACY
+    } else {
+        OP_DEVICE_INFO
+    }
+}
 pub const OP_UPDATE: u8 = 0x03;
 
 pub const SUB_STATUS: u8 = 0x14;
@@ -20,8 +33,12 @@ const STATUS_MIN: usize = 34;
 
 /// `2e` request: a timestamp (unused by us) and a fixed trailing word.
 pub fn device_info_request() -> Vec<u8> {
-    let mut out = vec![0u8; 12];
-    out.extend_from_slice(&0x3bu32.to_le_bytes());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut out = timestamp.to_le_bytes().to_vec();
+    out.extend_from_slice(&6u32.to_le_bytes());
     out
 }
 
@@ -55,6 +72,69 @@ impl DeviceInfo {
 
     pub fn is_updatable(&self) -> bool {
         self.capabilities & CAP_UPDATABLE != 0
+    }
+}
+
+/// Reply to the older device-info opcodes (`0x1c`/`0x23`): a different
+/// layout than `0x2e`'s, with an ASCII serial number `0x2e` does not carry
+/// at all. Decoded 2026-11-14 from a real Nano negotiating protocol 2.0.13
+/// (see `research/nano/README.md`).
+///
+/// `0x1c` and `0x23` are **not** the same reply despite sharing this prefix:
+/// a real device's `0x1c` reply is exactly 41 bytes (no capabilities at
+/// all), while its `0x23` reply is 51 bytes, with a capabilities `u32` at
+/// the same offset (`0x29`) `0x2e`'s reply uses. Still no firmware version
+/// either way (unlike `0x2e`) — that must come from the update-status
+/// opcode (`03`/`14`) instead. The unlabeled 16 bytes at `0x06`..`0x16` are
+/// unidentified either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyDeviceInfo {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub hardware_revision: u16,
+    /// 14 ASCII bytes, matched against the device's USB `iSerial` string on
+    /// real hardware.
+    pub serial: [u8; 14],
+    /// Present only in the longer (`0x23`-shaped) reply; `None` for the
+    /// shorter 41-byte `0x1c` one.
+    pub capabilities: Option<u32>,
+}
+
+const LEGACY_SERIAL_OFFSET: usize = 0x16;
+const LEGACY_SERIAL_LEN: usize = 14;
+const LEGACY_DEVICE_INFO_MIN: usize = LEGACY_SERIAL_OFFSET + LEGACY_SERIAL_LEN;
+/// Offset of the `u32` capabilities field in the longer reply, same offset
+/// `0x2e`'s reply uses.
+const LEGACY_CAPABILITIES_OFFSET: usize = 0x29;
+
+impl LegacyDeviceInfo {
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        if payload.len() < LEGACY_DEVICE_INFO_MIN {
+            return None;
+        }
+        let capabilities = payload
+            .get(LEGACY_CAPABILITIES_OFFSET..LEGACY_CAPABILITIES_OFFSET + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+        Some(Self {
+            vendor_id: u16::from_le_bytes([payload[0], payload[1]]),
+            product_id: u16::from_le_bytes([payload[2], payload[3]]),
+            hardware_revision: u16::from_le_bytes([payload[4], payload[5]]),
+            serial: payload[LEGACY_SERIAL_OFFSET..LEGACY_SERIAL_OFFSET + LEGACY_SERIAL_LEN]
+                .try_into()
+                .unwrap(),
+            capabilities,
+        })
+    }
+
+    /// `None` when this reply didn't carry capabilities at all (the short
+    /// `0x1c` shape).
+    pub fn is_updatable(&self) -> Option<bool> {
+        self.capabilities.map(|bits| bits & CAP_UPDATABLE != 0)
+    }
+
+    /// The serial as text, lossily: it has always been plain ASCII so far.
+    pub fn serial_string(&self) -> String {
+        String::from_utf8_lossy(&self.serial).into_owned()
     }
 }
 
@@ -101,6 +181,8 @@ pub struct UpdateStatus {
     /// instead of `11`), not implemented here.
     pub mode: u8,
     pub max_chunk: u16,
+    /// Number of firmware bytes the device has staged (present in full replies).
+    pub bytes_written: Option<u32>,
 }
 
 impl UpdateStatus {
@@ -117,6 +199,9 @@ impl UpdateStatus {
             flags: payload[26],
             mode: payload[27],
             max_chunk: u16::from_le_bytes([payload[32], payload[33]]),
+            bytes_written: payload
+                .get(60..64)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())),
         })
     }
 }
@@ -173,9 +258,8 @@ pub fn write_request(slot: u8, offset: u32, data: &[u8]) -> Vec<u8> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteReply {
     pub status: Status,
-    /// Bit 0: the device wants a restart before continuing. Not yet seen in
-    /// testing; if it occurs, the caller should treat it as a hard error
-    /// rather than silently pressing on.
+    /// Bit 0 is set on successful write replies from a retail Nano; the SDK
+    /// records it and continues writing.
     pub flags: u8,
 }
 
@@ -189,13 +273,20 @@ impl WriteReply {
             flags: payload.get(2).copied().unwrap_or(0),
         })
     }
+
+    pub fn parse_for_version(payload: &[u8], version: [u8; 3]) -> Option<Self> {
+        if version >= [2, 0, 8] && payload.len() < 3 {
+            return None;
+        }
+        Self::parse(payload)
+    }
 }
 
 /// `13`: finish. `foreground` is logged by the SDK as "yes"/"no"; consent
 /// (`0x04`) is not implemented here since a foreground update does not wait
 /// for it.
-pub fn finish_request(slot: u8, foreground: bool) -> Vec<u8> {
-    vec![SUB_FINISH, slot, if foreground { 1 } else { 0 }]
+pub fn finish_request_with_flags(slot: u8, flags: u8) -> Vec<u8> {
+    vec![SUB_FINISH, slot, flags]
 }
 
 pub fn finish_status(payload: &[u8]) -> Option<Status> {
@@ -208,6 +299,49 @@ pub fn finish_status(payload: &[u8]) -> Option<Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real `0x1c` reply, captured 2026-11-14 against a retail Nano
+    /// (`045e:0b4e`, serial `0D336JY2626BBP`) negotiating protocol 2.0.13;
+    /// see `research/nano/README.md`. Reported product ID is `0x0b4c`
+    /// (TALA's dev-board PID), not the USB descriptor's `0x0b4e`. Shorter
+    /// than `0x23`'s reply below despite sharing the same prefix: no
+    /// capabilities field at all.
+    const REAL_LEGACY_DEVICE_INFO: [u8; 41] = [
+        0x5e, 0x04, 0x4c, 0x0b, 0x06, 0x0c, 0x9c, 0x12, 0xe9, 0x14, 0x81, 0x03, 0x3d, 0xb9, 0xc2,
+        0x8e, 0xad, 0x90, 0xda, 0x88, 0xf7, 0x84, 0x30, 0x44, 0x33, 0x33, 0x36, 0x4a, 0x59, 0x32,
+        0x36, 0x32, 0x36, 0x42, 0x42, 0x50, 0x02, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// The same device's real `0x23` reply, captured 2026-11-14 right after
+    /// the 2e-opcode/1c-opcode reordering experiment in
+    /// `DEVICE_INFO_OPCODES`: identical 41-byte prefix, plus a 10-byte
+    /// suffix with a `u32` capabilities field at `0x29` (same offset `0x2e`
+    /// uses), value `0x3ff` here.
+    const REAL_LEGACY_DEVICE_INFO_23: [u8; 51] = [
+        0x5e, 0x04, 0x4c, 0x0b, 0x06, 0x0c, 0x9c, 0x12, 0xe9, 0x14, 0x81, 0x03, 0x3d, 0xb9, 0xc2,
+        0x8e, 0xad, 0x90, 0xda, 0x88, 0xf7, 0x84, 0x30, 0x44, 0x33, 0x33, 0x36, 0x4a, 0x59, 0x32,
+        0x36, 0x32, 0x36, 0x42, 0x42, 0x50, 0x02, 0x00, 0x00, 0x00, 0x00, 0xff, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn parses_real_legacy_device_info() {
+        let info = LegacyDeviceInfo::parse(&REAL_LEGACY_DEVICE_INFO).unwrap();
+        assert_eq!(info.vendor_id, 0x045e);
+        assert_eq!(info.product_id, 0x0b4c);
+        assert_eq!(info.hardware_revision, 0x0c06);
+        assert_eq!(info.serial_string(), "0D336JY2626BBP");
+        assert_eq!(info.capabilities, None);
+        assert_eq!(info.is_updatable(), None);
+    }
+
+    #[test]
+    fn parses_real_legacy_device_info_0x23_with_capabilities() {
+        let info = LegacyDeviceInfo::parse(&REAL_LEGACY_DEVICE_INFO_23).unwrap();
+        assert_eq!(info.serial_string(), "0D336JY2626BBP");
+        assert_eq!(info.capabilities, Some(0x3ff));
+        assert_eq!(info.is_updatable(), Some(true));
+    }
 
     #[test]
     fn parses_device_info() {

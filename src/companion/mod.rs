@@ -2,8 +2,7 @@
 //! and the rest of the Pendragon accessory family instead of GIP.
 //!
 //! Reverse engineered from the Xbox Accessories app's SDK and checked against
-//! a QEMU-emulated Nano (see `docs/nano.md`); not yet checked against
-//! physical hardware.
+//! both a QEMU-emulated Nano and physical retail hardware (see `docs/nano.md`).
 
 /// Fake device used as the device side in tests; the emulator for manual
 /// testing is the QEMU `usb-xbox-gip` device in `hid-reply=companion` mode.

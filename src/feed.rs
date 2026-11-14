@@ -62,6 +62,23 @@ pub struct FeedVersion {
     pub version: String,
 }
 
+impl FeedVersion {
+    /// Parse the feed's dotted four-part firmware version for ordering.
+    pub fn components(&self) -> Option<[u16; 4]> {
+        let mut parts = self.version.split('.').map(str::parse::<u16>);
+        let version = [
+            parts.next()?.ok()?,
+            parts.next()?.ok()?,
+            parts.next()?.ok()?,
+            parts.next()?.ok()?,
+        ];
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(version)
+    }
+}
+
 impl Feed {
     pub fn parse(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|error| format!("invalid firmware feed: {error}"))

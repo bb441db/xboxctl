@@ -160,6 +160,18 @@ enum TestAction {
         #[arg(long)]
         device: Option<String>,
     },
+    /// Start a Nano firmware session, but send no firmware data blocks.
+    NanoStart {
+        /// Exact USB serial of the physical Nano to target.
+        #[arg(long)]
+        serial: String,
+        /// PPAS image to start (must match the Nano hardware).
+        #[arg(required_unless_present = "latest", conflicts_with = "latest")]
+        image: Option<PathBuf>,
+        /// Download/select the current firmware from Microsoft's flight feed.
+        #[arg(long)]
+        latest: bool,
+    },
 }
 
 fn main() {
@@ -259,6 +271,21 @@ fn main() {
                 .and_then(|()| test_reset(device.as_deref(), trace_packets));
             if let Err(error) = result {
                 eprintln!("Reset test failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(debug_assertions)]
+        Command::Test {
+            action:
+                TestAction::NanoStart {
+                    serial,
+                    image,
+                    latest,
+                },
+        } => {
+            if let Err(error) = nano::start_probe(&serial, image.as_deref(), latest, trace_packets)
+            {
+                eprintln!("Nano start probe failed: {error}");
                 std::process::exit(1);
             }
         }

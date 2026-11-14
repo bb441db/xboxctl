@@ -60,13 +60,14 @@ impl FakeNano {
     fn update_response(&mut self, payload: &[u8]) -> Vec<u8> {
         match payload.first().copied() {
             Some(protocol::SUB_STATUS) => {
-                let mut out = vec![0u8; 34];
+                let mut out = vec![0u8; 80];
                 out[0] = protocol::SUB_STATUS;
                 out[2..18].copy_from_slice(&self.token);
                 for (i, word) in self.firmware_version.iter().enumerate() {
                     out[18 + i * 2..18 + i * 2 + 2].copy_from_slice(&word.to_le_bytes());
                 }
                 out[32..34].copy_from_slice(&self.max_chunk.to_le_bytes());
+                out[60..64].copy_from_slice(&(self.written.len() as u32).to_le_bytes());
                 out
             }
             Some(protocol::SUB_START) if payload.len() >= 27 => {
