@@ -164,8 +164,7 @@ range of each stick.
 
 Checked on an Xbox Series X|S controller (firmware 5.23). Firmware that does not
 support calibration does not answer (a Series X|S on 5.13.3146.0 did not) or
-refuses (an Xbox One S does, also on its latest firmware, 5.23, which has no
-calibration code), and `xboxctl` says so; `xboxctl update --latest` brings the controller up to date.
+refuses (an Xbox One S does), and `xboxctl` says so; `xboxctl update --latest` brings the controller up to date.
 A firmware update leaves the stored calibration alone: it was unchanged after
 going from 5.23 down to 5.13.3146.0 and back.
 
@@ -179,6 +178,19 @@ range when fully pressed. Checked on an Xbox Series X|S controller (firmware
 stays after a power cycle, as for the sticks.
 `xboxctl calibrate --trigger both --dry-run` only reads, and prints the stored
 range of each trigger with the raw replies.
+
+## Which controllers can calibrate
+
+Judged by whether the latest firmware in Microsoft's feed has the calibration
+code. On the two marked "no", `xboxctl calibrate` says that an update will not
+help.
+
+| Controller | Firmware | Calibration |
+|------------|----------|-------------|
+| Xbox Series X\|S Controller | 5.23.6.0 | yes, checked on a controller |
+| Xbox Elite Controller Series 2 | 5.23.6.0 | in the firmware, not checked on a controller |
+| Xbox One S Controller | 5.23.6.0 | no; refuses the request |
+| Xbox Adaptive Controller | 5.23.6.0 | no |
 
 ## Permissions
 
