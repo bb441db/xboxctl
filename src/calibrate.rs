@@ -543,7 +543,12 @@ pub fn run(
     }
 
     // The controller only answers on firmware that supports calibration.
+    let without_calibration = controller.vendor_id == 0x045e
+        && calibration::NO_CALIBRATION.contains(&controller.product_id);
     let unsupported = |error: String| match error.as_str() {
+        NO_REPLY | REJECTED if without_calibration => "This controller does not support \
+                 calibration: the latest firmware for it has none, so an update will not add it."
+            .to_owned(),
         NO_REPLY => "This controller did not answer the calibration request, so it probably \
                  does not support calibration. Newer firmware might: see `xboxctl update \
                  --latest --dry-run`."

@@ -6,6 +6,7 @@
 
 use crate::{
     gip::{
+        calibration::NO_CALIBRATION,
         frame::{self, Packet},
         report::{BUTTONS, GUIDE, InputReport, SHARE, guide_button},
         updater::Link,
@@ -34,8 +35,6 @@ const DRIFT_MAX: f64 = 0.30;
 
 /// USB product id of the Xbox Series X|S controller, the one with a share button.
 const SERIES_XS: u16 = 0x0b12;
-/// USB product id of the Xbox One S controller, which refuses calibration.
-const ONE_S: u16 = 0x02ea;
 
 /// Travel from which a stick or trigger counts as used, for the summary.
 const MOVED: f64 = 0.15;
@@ -151,7 +150,7 @@ impl View {
     fn new(product_id: u16) -> Self {
         Self {
             no_share: product_id != SERIES_XS,
-            no_calibration: product_id == ONE_S,
+            no_calibration: NO_CALIBRATION.contains(&product_id),
             ..Self::default()
         }
     }
@@ -669,7 +668,7 @@ mod tests {
             left: (3277, 0),
             ..InputReport::default()
         };
-        for (product_id, suggested) in [(SERIES_XS, true), (ONE_S, false)] {
+        for (product_id, suggested) in [(SERIES_XS, true), (0x02ea, false), (0x0b0a, false)] {
             let mut view = View::new(product_id);
             view.feed(drifting);
             view.tick(secs(1));

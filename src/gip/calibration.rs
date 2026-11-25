@@ -12,6 +12,12 @@ use super::frame::{self, Packet};
 
 pub const CMD_CALIBRATION: u8 = 0x1e;
 
+/// Product ids (vendor `045e`) whose current firmware in Microsoft's feed has
+/// no calibration: the Xbox One S and the Adaptive Controller, on 5.23.6.0.
+/// Their application images lack the calibration start handler that the
+/// Series X|S and the Elite Series 2 have.
+pub const NO_CALIBRATION: [u16; 2] = [0x02ea, 0x0b0a];
+
 /// Sub-command: read the current limits of the selected controls.
 const READ: u8 = 0x0f;
 /// Sub-command: start a calibration of the selected controls.
@@ -20,9 +26,7 @@ const RECENTER: u8 = 0x10;
 /// Which controls a request applies to: a mask of bit 0 left stick, bit 1
 /// right stick, bit 2 left trigger, bit 3 right trigger.
 ///
-/// The stick bits are observed. The trigger bits are an inference from the
-/// firmware (its trigger recenter looks at bits 2 and 3 of the same mask) and
-/// have not been checked against a controller yet.
+/// All four bits were checked on a Series X|S controller, firmware 5.23.6.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Controls(pub u8);
 
